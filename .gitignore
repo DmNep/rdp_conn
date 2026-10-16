@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+# Слоты проверок и собранный архив: бинарник, который собирается одной
+# командой из README.
+/tmp/
+/rdp_conn_portable.zip

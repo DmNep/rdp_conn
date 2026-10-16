@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rdp_conn"
+# Держать равным rdpconn/__init__.py:__version__. Это номер пакета, не версии протокола.
+version = "1.0.0"
+description = "Канал управления между двумя Windows через буфер обмена RDP: кадры с CRC, ACK/NAK, heartbeat, кириллица в cp866"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Дмитрий Непобедимый" }]
+keywords = ["rdp", "clipboard", "out-of-band", "mstsc", "admin"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: System :: Systems Administration",
+]
+
+# Пусто намеренно: канал нужен ровно тогда, когда на второй машине нельзя
+# ничего поставить. Проверка этой же строки — tools/test_frames.py.
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/DmNep/rdp_conn"
+Documentation = "https://github.com/DmNep/rdp_conn/blob/master/docs/protocol.md"
+
+[tool.setuptools]
+packages = ["rdpconn"]
