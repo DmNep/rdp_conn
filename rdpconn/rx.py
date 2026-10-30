@@ -15,11 +15,10 @@
 могла разъехаться — эхо это показывает). С --exec команда исполняется локально,
 а её вывод возвращается NOTE-кадрами.
 
-Своих PING rx не заводит (см. app.Heartbeat.proactive): отправитель и так
-обстреливает канал контрольными кадрами, а каждый PONG — уже признак жизни, так
-что порог молчания отрабатывает и без наших кадров. Двусторонний пинг удваивает
-записи в слот, а на лагающем RDP-редиректе это превращает heartbeat в шум,
-который сам же и мешает обмену.
+Своих контрольных PING rx не заводит (см. app.Heartbeat.proactive): отправитель
+и так пингует, а каждый PONG — уже признак жизни. Замер паузы повтора rx делает
+отдельно и только когда команд давно не было: иначе две проверки писали бы в
+слот одновременно.
 
 Остановка: --limit по числу кадров, --duration по времени. Без обоих слушает
 вечно до Ctrl-C.
@@ -33,7 +32,7 @@ import subprocess
 import sys
 import time
 
-from . import app, config, framing, segment
+from . import app, config, framing, segment, tune
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -129,23 +128,40 @@ def _exec_output(text: str, timeout: float, codec: str) -> str:
         return f"ошибка: {exc}"
 
 
+# Команда короче этого отвечает сразу, и повтор ответа стёр бы следующую.
+# Дольше — ответ пишется после долгого молчания и с первой записи не уезжает,
+# пока отправитель ещё ждёт. Один повтор новой ячейкой, как у команды.
+SLOW_REPLY_S = 8.0
+
+
+def arm_slow_reply(transport, elapsed: float) -> None:
+    """Один повтор ответа, если команда исполнялась долго."""
+    if elapsed < SLOW_REPLY_S:
+        return
+    if hasattr(transport, "_nudge_once"):
+        transport._nudge_once = True
+
+
 def _reply_for(args, seq: int, payload: bytes, codec: str):
     """ACK и следующие за ним NOTE для уже собранной команды.
 
     Команда здесь исполняется один раз. Пустое эхо тоже уходит одним NOTE:
     молчание на пустую команду неотличимо от потери кадра.
+    Третье значение — сколько секунд заняло исполнение. У эха это ноль.
     """
     frames = [framing.ack(seq)]
     if args.exec_:
+        started = time.monotonic()
         output = _exec_output(
             payload.decode(codec, errors="replace"),
             args.exec_timeout, codec,
         )
+        elapsed = time.monotonic() - started
         # Ограничение payload = 240 байт, поэтому разбиваем на NOTE-фразы.
         for i in range(0, len(output), config.MAX_PAYLOAD):
             chunk = output[i:i + config.MAX_PAYLOAD].encode(codec, errors="replace")
             frames.append(framing.build_frame(config.NOTE, seq, chunk))
-        return frames, False
+        return frames, False, elapsed
     if not args.no_echo:
         if not payload:
             frames.append(framing.echo(seq, payload))
@@ -153,13 +169,14 @@ def _reply_for(args, seq: int, payload: bytes, codec: str):
             for i in range(0, len(payload), config.MAX_PAYLOAD):
                 frames.append(framing.build_frame(
                     config.NOTE, seq, payload[i:i + config.MAX_PAYLOAD]))
-        return frames, True
-    return frames, False
+        return frames, True, 0.0
+    return frames, False, 0.0
 
 
 def _reply_frames(args, frame, codec: str):
     """ACK и NOTE на один кадр, который сам и есть команда."""
-    return _reply_for(args, frame.seq, frame.payload, codec)
+    frames, echo, _elapsed = _reply_for(args, frame.seq, frame.payload, codec)
+    return frames, echo
 
 
 def _log_sent(frames, echo: bool) -> None:
@@ -215,6 +232,101 @@ def _queued_cmds(transport):
         yield nxt
 
 
+def _plain_waiting(transport) -> bool:
+    """В очереди этого снимка есть ещё одна короткая команда."""
+    peek = getattr(transport, "peek_pending", None)
+    if peek is None:
+        return False
+    raw = peek()
+    if not raw:
+        return False
+    try:
+        nxt = framing.parse_frame(raw)
+    except framing.FrameError:
+        return False
+    return nxt.type == config.CMD and segment.unpack(nxt.payload) is None
+
+
+def _pull_one_plain(transport):
+    """Следующая короткая команда, уже лежащая в очереди этого снимка.
+
+    Кусок сегмента не забираем: он принадлежит длинной команде и собирается
+    своим путём. Чужой тип тоже остаётся в очереди.
+    """
+    peek = getattr(transport, "peek_pending", None)
+    pop = getattr(transport, "pop_pending", None)
+    if peek is None or pop is None:
+        return None
+    raw = peek()
+    if not raw:
+        return None
+    try:
+        nxt = framing.parse_frame(raw)
+    except framing.FrameError:
+        return None
+    if nxt.type != config.CMD or segment.unpack(nxt.payload) is not None:
+        return None
+    pop()
+    return nxt
+
+
+def _take_reply(args, fr, codec, cache):
+    """(кадры, эхо, секунды исполнения) для одной команды, из кэша или заново."""
+    cached = cache.get(fr.seq, fr.payload) if cache is not None else None
+    if cached is None:
+        part, part_echo, elapsed = _reply_for(args, fr.seq, fr.payload, codec)
+        if cache is not None:
+            cache.put(fr.seq, fr.payload, part, part_echo)
+        return part, part_echo, elapsed
+    part, part_echo = cached
+    return part, part_echo, 0.0
+
+
+def _reply_coalesced(args, transport, first, codec, cache) -> None:
+    """Один снимок ответа на короткие команды, уже лежащие в этом приёме.
+
+    Следующую команду берём, только если в снимке ещё есть место хотя бы
+    под её ACK и один NOTE. ACK каждой обязателен: по нему отправитель
+    видит, какой seq дошёл. NOTE, которым не хватило ячеек, в этот снимок
+    не пишутся — иначе запись затёрла бы собственные подтверждения.
+    """
+    frames_out = []
+    echo = False
+    elapsed_max = 0.0
+    commands = [first]
+    while len(commands) <= config.BATCH_COMMANDS:
+        fr = commands[-1]
+        if fr is not first:
+            app.say(f"<< {describe(fr, codec)}")
+            if args.show_hex:
+                app.say(f"   hex={fr.payload.hex()}")
+        part, part_echo, elapsed = _take_reply(args, fr, codec, cache)
+        echo = echo or part_echo
+        elapsed_max = max(elapsed_max, elapsed)
+        frames_out.extend(part)
+        if len(commands) >= config.BATCH_COMMANDS:
+            break
+        if len(frames_out) + 2 > config.HISTORY_SLOTS:
+            break
+        nxt = _pull_one_plain(transport)
+        if nxt is None:
+            break
+        commands.append(nxt)
+    if len(frames_out) > config.HISTORY_SLOTS:
+        acks = []
+        notes = []
+        for raw in frames_out:
+            if framing.parse_frame(raw).type == config.ACK:
+                acks.append(raw)
+            else:
+                notes.append(raw)
+        room = max(0, config.HISTORY_SLOTS - len(acks))
+        frames_out = acks + notes[:room]
+        app.warn(".. часть вывода не влезла в снимок")
+    arm_slow_reply(transport, elapsed_max)
+    _emit_reply(transport, frames_out, echo)
+
+
 def handle(args, transport, frame, err, codec: str = config.CODEPAGE,
            cache: ReplyCache | None = None,
            assembly: segment.Assembly | None = None) -> bool:
@@ -226,7 +338,15 @@ def handle(args, transport, frame, err, codec: str = config.CODEPAGE,
         # Подтверждаем только CMD: это то, что реально шлёт наша пара (tx).
         # ACK на ACK или ACK на чужой тип развёл бы бесконечный обмен, а
         # протокол требует ответа лишь кадрам, ждущим подтверждения.
+        if frame.type == config.CMD:
+            tune.touch()
         if not args.no_reply and frame.type == config.CMD:
+            # Короткие команды одного снимка отвечаются одной записью,
+            # в том числе вывод --exec, пока он помещается в ячейки.
+            if (segment.unpack(frame.payload) is None
+                    and _plain_waiting(transport)):
+                _reply_coalesced(args, transport, frame, codec, cache)
+                return True
             cached = cache.get(frame.seq, frame.payload) if cache is not None else None
             if cached is None:
                 kind, body = ("plain", frame.payload)
@@ -256,7 +376,8 @@ def handle(args, transport, frame, err, codec: str = config.CODEPAGE,
                         for part, raw_ack in zip(partials or [frame], frames):
                             cache.put(part.seq, part.payload, [raw_ack], False)
                 elif kind == "ready":
-                    frames, echo = _reply_for(args, answered.seq, body, codec)
+                    frames, echo, elapsed = _reply_for(args, answered.seq, body, codec)
+                    arm_slow_reply(transport, elapsed)
                     if cache is not None:
                         for part in partials:
                             cache.put(part.seq, part.payload, [framing.ack(part.seq)], False)
@@ -325,6 +446,9 @@ def main(argv=None) -> int:
     timeout = app.wait_timeout(args)
     # Приёмник на PING отвечает, но своих не заводит: см. Heartbeat.proactive.
     hb = app.make_heartbeat(args, proactive=False)
+    if tune.windows(transport):
+        # Замер здесь позже, чем у отправителя, и только на простое без команд.
+        tune.use(tune.Pace(idle_offset=90.0))
     cache = ReplyCache()
     assembly = segment.Assembly()
     started = time.monotonic()
@@ -341,6 +465,10 @@ def main(argv=None) -> int:
             if args.duration is not None:
                 wait = max(0.001, min(wait, args.duration - (time.monotonic() - started)))
             frame, err = app.receive_frame(transport, wait)
+            if frame is not None and tune.active() is not None:
+                tune.active().seen()
+            elif tune.active() is not None and err is None:
+                tune.active().maybe_idle(transport)
             if step(args, transport, hb, frame, err, codec, cache, assembly):
                 received += 1
     except KeyboardInterrupt:

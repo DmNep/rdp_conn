@@ -468,5 +468,73 @@ check("komanda sobrana do zapuska", hold_ran == [long_text], str(hold_ran))
 check("v otvete est ACK i NOTE", config.ACK in hold_types and config.NOTE in hold_types,
       str(hold_types))
 
+print("=== 17. dolgiy otvet povtoryaetsya, korotkiy net ===")
+
+
+class _Nudge:
+    def __init__(self):
+        self._nudge_once = False
+
+
+slow = _Nudge()
+rx.arm_slow_reply(slow, rx.SLOW_REPLY_S)
+check("dolgiy otvet zakazyvaet odin povtor", slow._nudge_once)
+fast = _Nudge()
+rx.arm_slow_reply(fast, 0.2)
+check("korotkiy otvet ne povtoryaetsya", not fast._nudge_once)
+
+print("=== 19. korotkie komandy delyat odin snimok ===")
+cb.MemoryClipboard.reset()
+batch_a = cb.ClipboardTransport(cb.MemoryClipboard(), peer_id="A")
+batch_b = cb.ClipboardTransport(cb.MemoryClipboard(), peer_id="B")
+batch_a.send_many([
+    framing.cmd(0, "one"),
+    framing.cmd(1, "two"),
+])
+first, _ = app.receive_frame(batch_b, 0.3)
+batch_args = rx.build_parser().parse_args(["--slot", "memory", "--ping", "0"])
+rx.handle(batch_args, batch_b, first, None, cache=rx.ReplyCache(),
+          assembly=segment.Assembly())
+back = []
+for _ in range(6):
+    got, _ = app.receive_frame(batch_a, 0.1)
+    if got is None:
+        break
+    back.append(got)
+ack_seqs = [f.seq for f in back if f.type == config.ACK]
+check("oba ACK v odnom otvete", ack_seqs == [0, 1], f"acks={ack_seqs}")
+check("echo obeih komand", [f.seq for f in back if f.type == config.NOTE] == [0, 1])
+batch_a.close()
+batch_b.close()
+
+groups = tx.groups(["aa", "bb", "cc"])
+check("tri korotkih — odin snimok", groups == [["aa", "bb", "cc"]], str(groups))
+wide = tx.groups(["x" * 300, "yy"])
+check("dlinnaya komanda edet otdelno", len(wide) == 2 and wide[1] == ["yy"], str(wide))
+
+
+class BatchSink(Sink):
+    def __init__(self):
+        super().__init__()
+        self.writes = 0
+
+    def send_many(self, frames):
+        self.writes += 1
+        self.sent.extend(frames)
+        for raw in frames:
+            cmd = framing.parse_frame(raw)
+            self.inbox.append(framing.ack(cmd.seq))
+            self.inbox.append(framing.build_frame(config.NOTE, cmd.seq, cmd.payload))
+
+
+batch_sink = BatchSink()
+batch_tx = tx.build_parser().parse_args(
+    ["--slot", "memory", "--ping", "0", "--wait", "1",
+     "--reply-wait", "0.05", "--retries", "1", "a", "b"])
+sent_ok = tx.send_batch(
+    batch_tx, batch_sink, app.SeqCounter(), ["a", "b"], app.Heartbeat(interval=0))
+check("dve komandy — odna zapis", sent_ok and batch_sink.writes == 1,
+      f"ok={sent_ok} writes={batch_sink.writes}")
+
 print("RESULT:", "FAIL\n  - " + "\n  - ".join(fails) if fails else "ALL GREEN")
 sys.exit(1 if fails else 0)

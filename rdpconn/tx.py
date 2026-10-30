@@ -4,8 +4,10 @@
     python -m rdpconn.tx --peer-id A --repl
     python -m rdpconn.tx --slot file:slot.txt --peer-id A "hostname"   # без Windows
 
-Полудуплекс соблюдает протокол: кадр ушёл, затем ждём ACK. Без подтверждения
-команда неотличима от потерянной, поэтому --no-ack только для отладки канала.
+Полудуплекс соблюдает протокол: кадр ушёл, затем ждём ACK. Короткие команды,
+которые уже ждут в очереди, делят один снимок: пауза редиректа платится за
+запись, а не за каждый кадр. Без подтверждения команда неотличима от
+потерянной, поэтому --no-ack только для отладки канала.
 
 Канал двусторонний, поэтому подтверждение — не единственный ожидаемый кадр.
 Чужой NOTE и PONG печатаются и попытку не тратят. NOTE с тем же seq, что у
@@ -25,7 +27,8 @@ import threading
 import time
 from queue import Empty, Queue
 
-from . import app, config, framing, segment
+from . import app, config, framing, segment, tune
+from .clipboard import SNAPSHOT_MAX
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -234,21 +237,118 @@ def _confirmed(args, reader: _Reader, hb, codec: str, seq: int,
     return False
 
 
-def send_one(args, transport, counter, text: str, hb, codec: str = config.CODEPAGE) -> bool:
-    """Один обмен: CMD, затем подтверждение с тем же seq. True — подтверждено.
+def _cost(text: str, codec: str):
+    """Сколько кадров и байт займёт команда, не занимая seq.
 
-    Текст длиннее кадра уходит несколькими CMD одной записью буфера. Вторая
-    запись сразу за первой на живом редиректе не доезжает: первый кусок
-    подтверждался, второй пропадал. Попытка — это вся команда. Сорвался один
-    кусок — со следующей попытки уходят все куски заново, с теми же номерами.
+    Третье значение — команда длиннее кадра. Такая едет своим снимком:
+    куски одной команды нельзя отрывать друг от друга, а ответ на них
+    занимает ячейки, которые иначе достались бы соседним командам.
     """
-    try:
-        pieces = _pieces(text, codec, counter)
-    except ValueError as exc:
-        app.warn(f"?? команда не отправлена: {exc}")
+    raw = text.encode(codec, errors="replace")
+    if len(raw) <= config.MAX_PAYLOAD:
+        return 1, 7 + len(raw), False
+    chunks = segment.split(raw)
+    total = len(chunks)
+    nbytes = 0
+    for index, chunk in enumerate(chunks):
+        payload = segment.pack(0, index, total, chunk)
+        nbytes += 7 + len(payload)
+    return total, nbytes, True
+
+
+def groups(texts, codec: str = config.CODEPAGE):
+    """Разложить очередь по снимкам.
+
+    Коротких команд в снимке — сколько уже ждёт, но не больше BATCH_COMMANDS,
+    HISTORY_SLOTS кадров и SNAPSHOT_MAX байт. Длинная команда — отдельный снимок.
+    """
+    batches = []
+    current = []
+    frames = 0
+    nbytes = 0
+    for text in texts:
+        nframes, size, segmented = _cost(text, codec)
+        if segmented:
+            if current:
+                batches.append(current)
+                current, frames, nbytes = [], 0, 0
+            batches.append([text])
+            continue
+        overflow = (
+            len(current) + 1 > config.BATCH_COMMANDS
+            or frames + nframes > config.HISTORY_SLOTS
+            or nbytes + size > SNAPSHOT_MAX
+        )
+        if current and overflow:
+            batches.append(current)
+            current, frames, nbytes = [], 0, 0
+        current.append(text)
+        frames += nframes
+        nbytes += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _confirmed_many(args, reader: _Reader, hb, codec: str, seqs,
+                    reply_wait: float) -> bool:
+    """Дождаться подтверждения каждого seq пачки. False — повторить пачку.
+
+    Ответ приходит одной записью: ACK и NOTE каждой команды лежат в очереди
+    сразу. Пока набор не закрыт, кадр из очереди не считается тишиной.
+    """
+    need = set(seqs)
+    timeout = app.wait_timeout(args)
+    deadline = time.monotonic() + timeout
+    reader.release()
+    while need and time.monotonic() < deadline:
+        left = max(0.05, deadline - time.monotonic())
+        frame, err = reader.receive(left)
+        if err is not None:
+            app.warn(f"?? подтверждение испорчено ({err}, code={err.code:#04x})")
+            return False
+        if frame is None:
+            app.warn(f".. тишина {timeout:.2f} с, подтверждения нет")
+            return False
+        if app.heartbeat_handle(hb, reader.transport, frame):
+            continue
+        _back(hb)
+        if frame.type == config.ACK and frame.seq in need:
+            app.say(f"<< ACK seq={frame.seq}")
+            need.discard(frame.seq)
+            continue
+        if frame.type == config.NAK and frame.seq in need:
+            app.warn(f"<< NAK seq={frame.seq} payload={frame.payload.hex()} "
+                     f"— не подтверждён, повторю")
+            return False
+        if frame.type in config.REPLY_TYPES and frame.seq in need:
+            show_reply(frame, codec)
+            need.discard(frame.seq)
+            continue
+        if frame.type in config.REPLY_TYPES:
+            show_reply(frame, codec)
+            continue
+        if frame.type == config.PONG or frame.type == config.ACK:
+            app.say(f"<< {frame.type_name} seq={frame.seq}")
+            continue
+        app.warn(f"?? ожидался ACK из {sorted(need)}, получен {frame}")
         return False
+    if need:
+        app.warn(f".. тишина {timeout:.2f} с, подтверждения нет")
+        return False
+    drain_reply(reader, reply_wait, hb, codec)
+    return True
+
+
+def _send_prepared(args, transport, prepared, hb, codec: str) -> bool:
+    """Отправить уже нарезанные команды одним снимком и дождаться ответа.
+
+    prepared — список команд, каждая команда — список кусков из _pieces.
+    Номера кусков уже выданы: повтор пачки несёт те же seq.
+    """
     for attempt in range(1, args.retries + 1):
         frames = [framing.build_frame(config.CMD, seq, payload)
+                  for pieces in prepared
                   for seq, payload, _label in pieces]
         if hasattr(transport, "_nudge_once"):
             # Первая запись после чужого снимка на редиректе часто пропадает.
@@ -262,17 +362,54 @@ def send_one(args, transport, counter, text: str, hb, codec: str = config.CODEPA
         if fail is not None:
             app.warn(f"?? CMD не отправлен: {fail}")
             continue
-        for seq, _payload, label in pieces:
-            app.say(f">> CMD seq={seq} {label} (попытка {attempt})")
+        for pieces in prepared:
+            for seq, _payload, label in pieces:
+                app.say(f">> CMD seq={seq} {label} (попытка {attempt})")
         if args.no_ack:
             return True
-        # Ждём только последний кусок. Промежуточный ACK приёмник затирает
-        # ответом на последний: в слоте остаётся один ответ, и ждать стёртый
-        # ACK — значит не дождаться команду, которая уже исполнилась.
         reader = _Reader(transport)
-        if _confirmed(args, reader, hb, codec, pieces[-1][0], args.reply_wait, set()):
+        closing = [pieces[-1][0] for pieces in prepared]
+        # Ждём только последний кусок каждой команды. Промежуточный ACK
+        # приёмник затирает ответом на последний.
+        if len(closing) == 1:
+            ok = _confirmed(args, reader, hb, codec, closing[0], args.reply_wait, set())
+        else:
+            ok = _confirmed_many(args, reader, hb, codec, closing, args.reply_wait)
+        if ok:
             return True
+        tune.on_exchange_failed()
     return False
+
+
+def send_batch(args, transport, counter, texts, hb, codec: str = config.CODEPAGE) -> bool:
+    """Отправить очередь. Короткие команды делят снимок, длинная едет одна.
+
+    False — хотя бы один снимок не подтверждён.
+    """
+    ok = True
+    tune.touch()
+    for group in groups(texts, codec):
+        prepared = []
+        try:
+            for text in group:
+                prepared.append(_pieces(text, codec, counter))
+        except ValueError as exc:
+            app.warn(f"?? команда не отправлена: {exc}")
+            return False
+        if not _send_prepared(args, transport, prepared, hb, codec):
+            ok = False
+    return ok
+
+
+def send_one(args, transport, counter, text: str, hb, codec: str = config.CODEPAGE) -> bool:
+    """Один обмен: CMD, затем подтверждение с тем же seq. True — подтверждено.
+
+    Текст длиннее кадра уходит несколькими CMD одной записью буфера. Вторая
+    запись сразу за первой на живом редиректе не доезжает: первый кусок
+    подтверждался, второй пропадал. Попытка — это вся команда. Сорвался один
+    кусок — со следующей попытки уходят все куски заново, с теми же номерами.
+    """
+    return send_batch(args, transport, counter, [text], hb, codec)
 
 
 def stdin_lines():
@@ -309,10 +446,44 @@ def idle(args, transport, hb) -> None:
     if app.heartbeat_handle(hb, transport, frame):
         return
     if frame is not None:
+        if tune.active() is not None:
+            tune.active().seen()
         _back(hb)
         app.say(f"<< {frame}")
+    if tune.active() is not None:
+        tune.active().maybe_idle(transport)
     app.heartbeat_tick(hb, transport)
     app.heartbeat_check(hb, transport)
+
+
+def _ready_lines(lines, first: str):
+    """Забрать всё, что уже лежит во вводе, не дожидаясь следующей строки.
+
+    Пока человек думает, очередь пустая и снимку нечего уплотнять. Несколько
+    команд, введённых подряд, уходят одной записью.
+    """
+    stop = False
+    batch = []
+
+    def take(line) -> bool:
+        nonlocal stop
+        if line is None or line.strip() in (".q", ".quit", ".exit"):
+            stop = True
+            return False
+        if line.strip():
+            batch.append(line)
+        return True
+
+    if not take(first):
+        return batch, stop
+    while True:
+        try:
+            nxt = lines.get_nowait()
+        except Empty:
+            break
+        if not take(nxt):
+            break
+    return batch, stop
 
 
 def main(argv=None) -> int:
@@ -335,8 +506,12 @@ def main(argv=None) -> int:
     hb = app.make_heartbeat(args)
     failures = 0
     try:
-        for text in args.command:
-            if not send_one(args, transport, counter, text, hb, codec):
+        if tune.windows(transport):
+            tune.use(tune.Pace())
+            if tune.active().measure(transport, "старт"):
+                hb.note()
+        if args.command:
+            if not send_batch(args, transport, counter, list(args.command), hb, codec):
                 failures += 1
             idle(args, transport, hb)
         if args.repl:
@@ -353,12 +528,11 @@ def main(argv=None) -> int:
                 if line is None:
                     app.say("")
                     break
-                if line.strip() in (".q", ".quit", ".exit"):
-                    break
-                if not line.strip():
-                    continue
-                if not send_one(args, transport, counter, line, hb, codec):
+                batch, stop = _ready_lines(lines, line)
+                if batch and not send_batch(args, transport, counter, batch, hb, codec):
                     failures += 1
+                if stop:
+                    break
     finally:
         channel.close()
     return 1 if failures else 0
