@@ -178,19 +178,148 @@ print("=== 3h. chuzhaya istoriya v slote ne byvaet dlinnee nashei ===")
 # versiya koda ili pravka vruchnuyu). Perenosya e kak est, my razduvayem tekst
 # slota, kotoryi drugaya storona perechityvaet pered kazhdoi zapisyu.
 cb.MemoryClipboard.reset()
-long_chain = "|".join("OLD:%d:%s" % (n, base64.b64encode(b"x" * 8).decode("ascii"))
-                      for n in range(1, 12))
+last = cb.HISTORY_SLOTS + 8
+long_chain = "|".join(
+    "OLD:%d:%s" % (n, base64.b64encode(b"x" * 8).decode("ascii"))
+    for n in range(1, last + 1))
 cb.MemoryClipboard().write("RDP1|" + long_chain)
 me2 = cb.ClipboardTransport(cb.MemoryClipboard(), peer_id="NEW")
 me2.send(cases[0][1])
 slotted = cb.MemoryClipboard().read()
 check("chuzhaya istoriya obrezana", slotted.count("|OLD:") <= cb.HISTORY_SLOTS,
-      f"yacheyek OLD={slotted.count('|OLD:')} iz 11, dlina={len(slotted)}")
-check("naiboleye svezhie chuzhie sokhraneny", "|OLD:11:" in slotted,
+      f"yacheyek OLD={slotted.count('|OLD:')} iz {last}, dlina={len(slotted)}")
+check("naiboleye svezhie chuzhie sokhraneny", "|OLD:%d:" % last in slotted,
       "obrezat' nado starshe, a ne svezhie")
-check("priyom pri etom ne straadaet", me2.receive(timeout=0.2) is not None,
-      "kadr OLD dolzhen byt' otdan do togo, kak my ego vyperli")
-me2.close()
+check("samye starye chuzhie vybrosheny", "|OLD:1:" not in slotted)
+check("uzhe lezhavshee ne chitaetsya snova", me2.receive(timeout=0.05) is None,
+      "novyy protsess ne pereigryvaet slot, v kotoryy on tolko chto voshel")
+old = cb.ClipboardTransport(cb.MemoryClipboard(), peer_id="OLD")
+old.send(cases[2][1])
+check("novyy kadr posle starta dohodyit", me2.receive(timeout=0.2) == cases[2][1])
+old.close(); me2.close()
+
+print("=== 3i. novyy protsess ne otdaet staryy ACK kak otvet ===")
+cb.MemoryClipboard.reset()
+old_b = cb.ClipboardTransport(cb.MemoryClipboard(), peer_id="B")
+old_b.send(cases[0][1])
+old_b.close()
+fresh = cb.ClipboardTransport(cb.MemoryClipboard(), peer_id="A")
+fresh.send(cases[2][1])
+check("staryy ACK ne v ocheredi", fresh.receive(timeout=0.1) is None,
+      "inache seq=0 novogo tx sovpal by so starym podtverzhdeniem")
+fresh.close()
+
+print("=== 3j. neudachnoe chtenie ne sdvigaet kursor ===")
+cb.MemoryClipboard.reset()
+
+
+class FlakyRead:
+    def __init__(self):
+        self.inner = cb.MemoryClipboard()
+        self.fails = 0
+
+    def seq(self):
+        return self.inner.seq()
+
+    def read(self):
+        if self.fails:
+            self.fails -= 1
+            raise cb.ClipboardError("busy")
+        return self.inner.read()
+
+    def write(self, text):
+        self.inner.write(text)
+
+
+flaky = FlakyRead()
+reader = cb.ClipboardTransport(flaky, peer_id="A")
+writer = cb.ClipboardTransport(cb.MemoryClipboard(), peer_id="B")
+writer.send(cases[2][1])
+flaky.fails = 1
+got = reader.receive(timeout=0.4)
+check("kadr na meste posle zanyatogo bufera", got == cases[2][1],
+      f"got={got!r}")
+reader.close(); writer.close()
+
+print("=== 3k. pachka otveta ne stirayet ACK ===")
+cb.MemoryClipboard.reset()
+notes = (config.EXEC_OUTPUT_LIMIT + config.MAX_PAYLOAD - 1) // config.MAX_PAYLOAD
+burst = [framing.ack(1)]
+for i in range(notes):
+    burst.append(framing.build_frame(config.NOTE, 1, bytes([i])))
+side = cb.ClipboardTransport(cb.MemoryClipboard(), peer_id="B")
+for raw in burst:
+    side.send(raw)
+text = cb.MemoryClipboard().read() or ""
+missing = [raw for raw in burst if base64.b64encode(raw).decode("ascii") not in text]
+check("ves otvet viden v slote", not missing,
+      f"poteryano {len(missing)} iz {len(burst)}, slots={cb.HISTORY_SLOTS}")
+side.send(framing.pong(1))
+ack_b64 = base64.b64encode(burst[0]).decode("ascii")
+check("sluzhebnaya yacheyka ne vytesnyaet ACK",
+      ack_b64 in (cb.MemoryClipboard().read() or ""))
+side.send(framing.pong(2))
+check("za predelom istorii ACK uzhe ne obyazan lezhat",
+      ack_b64 not in (cb.MemoryClipboard().read() or ""))
+side.close()
+
+print("=== 3l. otvet pishhetsya odnoi zapisyu ===")
+cb.MemoryClipboard.reset()
+
+
+class Counting(cb.MemoryClipboard):
+    writes = 0
+
+    def write(self, text):
+        Counting.writes += 1
+        super().write(text)
+
+
+Counting.writes = 0
+store = Counting()
+burst = [framing.ack(1)]
+for i in range(7):
+    burst.append(framing.build_frame(config.NOTE, 1, bytes([i])))
+writer = cb.ClipboardTransport(store, peer_id="B")
+reader = cb.ClipboardTransport(store, peer_id="A")
+writer.send_many(burst)
+text = store.read() or ""
+missing = [raw for raw in burst if base64.b64encode(raw).decode("ascii") not in text]
+check("odna zapis na ves otvet", Counting.writes == 1, f"writes={Counting.writes}")
+check("vse kadry v etoi zapisi", not missing, f"net {len(missing)}")
+got = []
+while True:
+    item = reader.receive(timeout=0.05)
+    if item is None:
+        break
+    got.append(item)
+check("ACK prihodit pervym", got[:1] == burst[:1])
+check("pachka doshla celikom i po poryadku", got == burst, f"got={len(got)}")
+writer.close(); reader.close()
+
+print("=== 3m. novyy otvet ne vezet yacheyki proshlogo ===")
+cb.MemoryClipboard.reset()
+old = [framing.ack(1), framing.build_frame(config.NOTE, 1, b"OLD-REPLY")]
+new = [framing.ack(2), framing.build_frame(config.NOTE, 2, b"NEW-REPLY")]
+side = cb.ClipboardTransport(cb.MemoryClipboard(), peer_id="B")
+peer = cb.ClipboardTransport(cb.MemoryClipboard(), peer_id="A")
+side.send_many(old)
+while peer.receive(timeout=0.05) is not None:
+    pass
+side.send_many(new)
+text = cb.MemoryClipboard().read() or ""
+old_b64 = base64.b64encode(old[1]).decode("ascii")
+new_b64 = base64.b64encode(new[1]).decode("ascii")
+check("staryy NOTE ne v novoi zapisi", old_b64 not in text)
+check("novyy NOTE v zapisi", new_b64 in text)
+got = []
+while True:
+    item = peer.receive(timeout=0.05)
+    if item is None:
+        break
+    got.append(item)
+check("prinyat tolko novyy otvet", got == new, f"got={got!r}")
+side.close(); peer.close()
 
 print("=== 4. chuzhaya kopiya: ne razbiraetsya, zanimaet slot, NO priyoma ne glushit ===")
 a, b = pair()
@@ -346,6 +475,86 @@ b.send(cases[0][1])
 check("obratno cherez fail", a.receive(timeout=0.3) == cases[0][1])
 a.close(); b.close()
 os.remove(path)
+
+print("=== 11. tikhiy povtor — novaya yacheika teh zhe baitov ===")
+cb.MemoryClipboard.reset()
+a = cb.ClipboardTransport(cb.MemoryClipboard(), peer_id="A")
+a.send(cases[2][1])
+first_cells = a._parse(cb.MemoryClipboard._text)["A"]
+a._nudge_mine = a._my_history
+a._nudge_at = 0
+a._maybe_nudge()
+second_cells = a._parse(cb.MemoryClipboard._text)["A"]
+check("novyi nomer yacheiki", second_cells[-1][0] != first_cells[-1][0],
+      str(second_cells))
+check("payload tot zhe", second_cells[-1][1] == first_cells[-1][1])
+check("povtor sam sebya ne zakazyvaet", a._nudge_at is None)
+kept = cb.MemoryClipboard._text
+a._pending.append(b"already")
+a._nudge_mine = a._my_history
+a._nudge_at = 0
+a._maybe_nudge()
+check("otvet v ocheredi — povtor ne pishem", cb.MemoryClipboard._text == kept)
+check("povtor otlozhen, a ne otmenen",
+      a._nudge_at is not None and a._nudge_mine is a._my_history)
+a._pending.clear()
+a._nudge_at = 0
+a._maybe_nudge()
+check("posle ocheredi povtor pishetsya", cb.MemoryClipboard._text != kept)
+a.close()
+
+print("=== 12. nomer slota operezhaet tekst ===")
+
+
+class LateStore:
+    def __init__(self):
+        self.seq_n = 1
+        self.text = None
+        self.pending = None
+        self.delay = 0
+
+    def seq(self):
+        return self.seq_n
+
+    def read(self):
+        if self.delay > 0:
+            self.delay -= 1
+            return self.text
+        if self.pending is not None:
+            self.text = self.pending
+            self.pending = None
+        return self.text
+
+    def write(self, text):
+        self.text = text
+        self.seq_n += 1
+
+
+late = LateStore()
+rx = cb.ClipboardTransport(late, peer_id="B", auto_pause=False)
+payload = cases[0][1]
+late.seq_n = 8
+late.delay = 1
+late.pending = "RDP1|A:7:" + base64.b64encode(payload).decode("ascii")
+got = rx.receive(2.5)
+check("kadr doshel so vtorogo chteniya", got == payload, repr(got)[:80] if got else "None")
+rx.close()
+
+print("=== 13. snimok krupnee 16 KB rezhetsya ===")
+one = cb.snapshot_pieces(b"x" * cb.SNAPSHOT_MAX)
+check("16 KB — odna zapis", len(one) == 1 and len(one[0]) == cb.SNAPSHOT_MAX)
+four = cb.snapshot_pieces(b"y" * (cb.SNAPSHOT_MAX * 4))
+check("64 KB — chetyre zapisi",
+      [len(part) for part in four] == [cb.SNAPSHOT_MAX] * 4)
+check("kuski skleivayutsya", b"".join(four) == b"y" * (cb.SNAPSHOT_MAX * 4))
+cb.MemoryClipboard.reset()
+big = cb.ClipboardTransport(cb.MemoryClipboard(), peer_id="A")
+try:
+    big._publish(b"z" * (cb.SNAPSHOT_MAX + 1))
+    check("snimok krupnee predela ne pishhetsya", False, "zapisalas")
+except ValueError:
+    check("snimok krupnee predela ne pishhetsya", True)
+big.close()
 
 print()
 print("RESULT:", "FAIL\n  - " + "\n  - ".join(fails) if fails else "ALL GREEN")

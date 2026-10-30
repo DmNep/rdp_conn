@@ -28,16 +28,12 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import time
 
-from . import app, config, framing
-
-# Потолок возвращаемого вывода. Кадр держит 240 байт, поэтому вывод и так идёт
-# несколькими NOTE; без потолка одна `type big.log` заполнила бы буфер обмена на
-# минуты и забил бы весь канал.
-EXEC_OUTPUT_LIMIT = 4096
+from . import app, config, framing, segment
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -64,6 +60,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def describe(frame, codec: str = config.CODEPAGE) -> str:
     payload = frame.payload
+    piece = segment.unpack(payload) if frame.type == config.CMD else None
+    if piece is not None:
+        _group, index, count, _data = piece
+        return f"{frame} часть {index + 1}/{count}"
     if payload and len(payload) <= 48:
         if frame.type in (config.CMD, config.NOTE):
             return f"{frame} payload={payload.decode(codec, errors='replace')!r}"
@@ -71,37 +71,153 @@ def describe(frame, codec: str = config.CODEPAGE) -> str:
     return str(frame)
 
 
-def _send_exec_output(transport, frame, args, codec: str = config.CODEPAGE) -> None:
-    """Исполнить команду и вернуть вывод NOTE-кадрами.
+class ReplyCache:
+    """Ответ на CMD, уже собранный для этого seq.
 
-    Если команда не выполняется, возвращаем текст ошибки: пустой ответ
-    неотличим от молчавшего канала.
+    Повтор протокола обязан нести тот же seq (docs/protocol.md 4). Исполнять
+    команду второй раз нельзя: повтор — это «доставь прежний ответ», а не
+    новая работа. Ключ — пара (seq, payload). Один только seq после оборота
+    счётчика совпал бы с новой командой, и кэш отдал бы чужой вывод.
     """
-    text = frame.payload.decode(codec, errors="replace")
+
+    def __init__(self) -> None:
+        self._items = {}
+
+    def get(self, seq: int, payload: bytes):
+        item = self._items.get(seq)
+        if item is None or item[0] != payload:
+            return None
+        return item[1], item[2]
+
+    def put(self, seq: int, payload: bytes, frames: list, echo: bool) -> None:
+        self._items[seq] = (bytes(payload), list(frames), echo)
+
+
+def _run_command(text: str, timeout: float):
+    """Запустить строку команды и вернуть CompletedProcess.
+
+    shell=True на Windows собирает `cmd /c "<текст>"`. У cmd при этом своё
+    правило кавычек: последняя кавычка остаётся на последнем слове, и
+    `cmd /c set` превращается в программу `set"`. Поэтому на Windows строка
+    уходит в `cmd /d /s /c` без второй оболочки: /s снимает кавычки
+    предсказуемо, /d не читает AutoRun.
+    """
+    if os.name == "nt":
+        comspec = os.environ.get("COMSPEC", "cmd.exe")
+        return subprocess.run(
+            [comspec, "/d", "/s", "/c", text],
+            capture_output=True,
+            timeout=timeout,
+        )
+    return subprocess.run(
+        text, capture_output=True, shell=True, timeout=timeout,
+    )
+
+
+def _exec_output(text: str, timeout: float, codec: str) -> str:
+    """Вывод команды. Ошибка тоже текст: пустой ответ неотличим от молчания."""
     try:
         # Без text=True: он декодирует вывод локальной ANSI-страницей (cp1251),
         # а cmd.exe пишет в OEM-странице консоли. Кириллица в выводе
         # превращалась бы в '?' ещё до попадания в кадр.
-        proc = subprocess.run(text, capture_output=True, shell=True,
-                              timeout=args.exec_timeout)
+        proc = _run_command(text, timeout)
         raw = proc.stdout if proc.returncode == 0 else proc.stderr
-        output = raw.decode(codec, errors="replace")[:EXEC_OUTPUT_LIMIT]
+        return raw.decode(codec, errors="replace")[:config.EXEC_OUTPUT_LIMIT]
     except subprocess.TimeoutExpired:
-        output = f"команда прервана по таймауту {args.exec_timeout:.0f} с"
+        return f"команда прервана по таймауту {timeout:.0f} с"
     except Exception as exc:
-        output = f"ошибка: {exc}"
-    # Ограничение payload = 240 байт, поэтому разбиваем на NOTE-фразы.
-    for i in range(0, len(output), config.MAX_PAYLOAD):
-        chunk = output[i:i + config.MAX_PAYLOAD].encode(codec, errors="replace")
-        fail = app.send_frame(transport, framing.build_frame(config.NOTE, frame.seq, chunk))
-        if fail is None:
-            app.say(f">> NOTE seq={frame.seq} len={len(chunk)}")
+        return f"ошибка: {exc}"
+
+
+def _reply_for(args, seq: int, payload: bytes, codec: str):
+    """ACK и следующие за ним NOTE для уже собранной команды.
+
+    Команда здесь исполняется один раз. Пустое эхо тоже уходит одним NOTE:
+    молчание на пустую команду неотличимо от потери кадра.
+    """
+    frames = [framing.ack(seq)]
+    if args.exec_:
+        output = _exec_output(
+            payload.decode(codec, errors="replace"),
+            args.exec_timeout, codec,
+        )
+        # Ограничение payload = 240 байт, поэтому разбиваем на NOTE-фразы.
+        for i in range(0, len(output), config.MAX_PAYLOAD):
+            chunk = output[i:i + config.MAX_PAYLOAD].encode(codec, errors="replace")
+            frames.append(framing.build_frame(config.NOTE, seq, chunk))
+        return frames, False
+    if not args.no_echo:
+        if not payload:
+            frames.append(framing.echo(seq, payload))
         else:
-            app.warn(f"?? NOTE seq={frame.seq} не отправлен: {fail}")
-            break
+            for i in range(0, len(payload), config.MAX_PAYLOAD):
+                frames.append(framing.build_frame(
+                    config.NOTE, seq, payload[i:i + config.MAX_PAYLOAD]))
+        return frames, True
+    return frames, False
 
 
-def handle(args, transport, frame, err, codec: str = config.CODEPAGE) -> bool:
+def _reply_frames(args, frame, codec: str):
+    """ACK и NOTE на один кадр, который сам и есть команда."""
+    return _reply_for(args, frame.seq, frame.payload, codec)
+
+
+def _log_sent(frames, echo: bool) -> None:
+    for raw in frames:
+        frame = framing.parse_frame(raw)
+        if frame.type == config.ACK:
+            app.say(f">> ACK seq={frame.seq}")
+        elif echo:
+            app.say(f">> NOTE seq={frame.seq} (эхо)")
+        else:
+            app.say(f">> NOTE seq={frame.seq} len={len(frame.payload)}")
+
+
+def _emit_reply(transport, frames, echo: bool) -> None:
+    """Отправить уже собранный ответ: и первый раз, и повтор из кэша.
+
+    Пачка уходит одной записью буфера. По кадру редирект успевает увезти
+    промежуточный снимок, и хвост вывода до отправителя не доезжает.
+    """
+    fail = app.send_frames(transport, frames)
+    if fail is None:
+        _log_sent(frames, echo)
+        return
+    frame = framing.parse_frame(frames[0])
+    if frame.type == config.ACK:
+        app.warn(f"?? ACK seq={frame.seq} не отправлен: {fail}")
+    else:
+        app.warn(f"?? NOTE seq={frame.seq} не отправлен: {fail}")
+
+
+def _queued_cmds(transport):
+    """CMD, которые уже лежат в очереди транспорта.
+
+    Куски одной команды приходят одной записью слота. Пока мы не ответили
+    на первый, остальные уже разобраны. Отвечать на первый отдельно — значит
+    занять редирект снимком, после которого настоящий ответ уже не доезжает.
+    """
+    peek = getattr(transport, "peek_pending", None)
+    pop = getattr(transport, "pop_pending", None)
+    if peek is None or pop is None:
+        return
+    while True:
+        raw = peek()
+        if not raw:
+            return
+        try:
+            nxt = framing.parse_frame(raw)
+        except framing.FrameError:
+            return
+        if nxt.type != config.CMD:
+            return
+        pop()
+        yield nxt
+
+
+def handle(args, transport, frame, err, codec: str = config.CODEPAGE,
+           cache: ReplyCache | None = None,
+           assembly: segment.Assembly | None = None) -> bool:
     """Обработать один приём. True — засчитать событие (для --limit)."""
     if frame is not None:
         app.say(f"<< {describe(frame, codec)}")
@@ -111,20 +227,47 @@ def handle(args, transport, frame, err, codec: str = config.CODEPAGE) -> bool:
         # ACK на ACK или ACK на чужой тип развёл бы бесконечный обмен, а
         # протокол требует ответа лишь кадрам, ждущим подтверждения.
         if not args.no_reply and frame.type == config.CMD:
-            fail = app.send_frame(transport, framing.ack(frame.seq))
-            if fail is None:
-                app.say(f">> ACK seq={frame.seq}")
-            else:
-                app.warn(f"?? ACK seq={frame.seq} не отправлен: {fail}")
-            # --exec заменяет эхо на запуск команды: вывод идёт NOTE-пакетами.
-            if args.exec_:
-                _send_exec_output(transport, frame, args, codec)
-            elif not args.no_echo:
-                fail = app.send_frame(transport, framing.echo(frame.seq, frame.payload))
-                if fail is None:
-                    app.say(f">> NOTE seq={frame.seq} (эхо)")
+            cached = cache.get(frame.seq, frame.payload) if cache is not None else None
+            if cached is None:
+                kind, body = ("plain", frame.payload)
+                if assembly is not None:
+                    kind, body = assembly.take(frame.payload)
+                partials = []
+                answered = frame
+                if kind == "wait" and assembly is not None:
+                    # Следующие куски уже в очереди — собираем их до записи
+                    # в буфер. Промежуточный ACK отдельной записью оставлял
+                    # на хосте себя, а ответ последнего куска не доезжал.
+                    partials.append(frame)
+                    for nxt in _queued_cmds(transport):
+                        app.say(f"<< {describe(nxt, codec)}")
+                        if args.show_hex:
+                            app.say(f"   hex={nxt.payload.hex()}")
+                        nkind, nbody = assembly.take(nxt.payload)
+                        if nkind == "wait":
+                            partials.append(nxt)
+                            continue
+                        kind, body, answered = nkind, nbody, nxt
+                        break
+                if kind == "wait":
+                    frames = [framing.ack(part.seq) for part in (partials or [frame])]
+                    echo = False
+                    if cache is not None:
+                        for part, raw_ack in zip(partials or [frame], frames):
+                            cache.put(part.seq, part.payload, [raw_ack], False)
+                elif kind == "ready":
+                    frames, echo = _reply_for(args, answered.seq, body, codec)
+                    if cache is not None:
+                        for part in partials:
+                            cache.put(part.seq, part.payload, [framing.ack(part.seq)], False)
+                        cache.put(answered.seq, answered.payload, frames, echo)
                 else:
-                    app.warn(f"?? NOTE seq={frame.seq} не отправлен: {fail}")
+                    frames, echo = _reply_frames(args, answered, codec)
+                    if cache is not None:
+                        cache.put(answered.seq, answered.payload, frames, echo)
+            else:
+                frames, echo = cached
+            _emit_reply(transport, frames, echo)
         return True
     if err is not None:
         app.warn(f"!! испорченный кадр: {err} (code={err.code:#04x}, seq={err.seq})")
@@ -138,7 +281,9 @@ def handle(args, transport, frame, err, codec: str = config.CODEPAGE) -> bool:
     return False
 
 
-def step(args, transport, hb, frame, err, codec: str = config.CODEPAGE) -> bool:
+def step(args, transport, hb, frame, err, codec: str = config.CODEPAGE,
+         cache: ReplyCache | None = None,
+         assembly: segment.Assembly | None = None) -> bool:
     """Обработать один приём вместе с heartbeat. True — засчитать событие.
 
     Порядок здесь важнее содержания: heartbeat обязан отрабатывать, не прерывая
@@ -161,7 +306,7 @@ def step(args, transport, hb, frame, err, codec: str = config.CODEPAGE) -> bool:
         app.say(".. собеседник снова отвечает")
     app.heartbeat_tick(hb, transport)
     app.heartbeat_check(hb, transport)
-    return handle(args, transport, frame, err, codec)
+    return handle(args, transport, frame, err, codec, cache, assembly)
 
 
 def main(argv=None) -> int:
@@ -180,6 +325,8 @@ def main(argv=None) -> int:
     timeout = app.wait_timeout(args)
     # Приёмник на PING отвечает, но своих не заводит: см. Heartbeat.proactive.
     hb = app.make_heartbeat(args, proactive=False)
+    cache = ReplyCache()
+    assembly = segment.Assembly()
     started = time.monotonic()
     received = 0
     try:
@@ -194,7 +341,7 @@ def main(argv=None) -> int:
             if args.duration is not None:
                 wait = max(0.001, min(wait, args.duration - (time.monotonic() - started)))
             frame, err = app.receive_frame(transport, wait)
-            if step(args, transport, hb, frame, err, codec):
+            if step(args, transport, hb, frame, err, codec, cache, assembly):
                 received += 1
     except KeyboardInterrupt:
         app.say("")

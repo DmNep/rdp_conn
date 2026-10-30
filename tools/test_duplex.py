@@ -21,6 +21,8 @@ import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 AM = ROOT
+sys.path.insert(0, ROOT)
+from rdpconn import rx as rx_mod
 PY = sys.executable
 ENV = dict(os.environ, PYTHONPATH=os.pathsep.join([ROOT, AM]), PYTHONIOENCODING="utf-8")
 
@@ -98,6 +100,15 @@ check("komanda ispolnena i vyvod doshel", "hello_from_b" in out,
       f"tx: {[l for l in out.splitlines() if 'NOTE' in l]}")
 check("rx soobshchil o NOTE", ">> NOTE" in rx_out)
 
+print("=== 2b. cmd /c ne prileplyaet kavychku k poslednemu slovu ===")
+echo = rx_mod._run_command("cmd /c echo hello_exact", 10)
+echo_text = echo.stdout.decode("cp866", errors="replace")
+check("echo bez hvoska-kavychki", echo_text.strip() == "hello_exact", repr(echo_text))
+env = rx_mod._run_command("cmd /c set", 10)
+env_text = env.stdout.decode("cp866", errors="replace")
+check("set vernul okruzhenie", env.returncode == 0 and "SystemRoot=" in env_text,
+      env_text[:80])
+
 print("=== 3. bez --exec: NOTE-eho (vidno, chto doehало) ===")
 slot3 = os.path.join(tmp, "slot3.txt")
 rx = start(["rdpconn.rx", "--slot", f"file:{slot3}",
@@ -159,6 +170,28 @@ check("eho doshlo kirillicei", "уцкуцк" in out,
       f"tx: {[l for l in out.splitlines() if 'NOTE' in l]}")
 check("rx rashifroval komandu, a ne '??????'", "уцкуцк" in rx_out,
       f"rx: {[l for l in rx_out.splitlines() if 'CMD' in l]}")
+
+print("=== 7. komanda dlinnee 240 bait sobiraetsya i ne padaet ===")
+slot7 = os.path.join(tmp, "slot7.txt")
+long_cmd = "echo " + ("Q" * 260)
+rx = start(["rdpconn.rx", "--slot", f"file:{slot7}",
+            "--peer-id", "B", "--ping", "0", "--exec", "--duration", "30"])
+time.sleep(1.5)
+out, err, code = run(["rdpconn.tx", "--slot",
+                      f"file:{slot7}", "--peer-id", "A", "--ping", "0",
+                      "--wait", "5", "--reply-wait", "2", "--retries", "2",
+                      long_cmd], timeout=40)
+rx.terminate()
+rx_out, _ = rx.communicate(timeout=10)
+check("tx ne upal i vyshel 0", code == 0 and "ValueError" not in (out + err),
+      f"code={code} err={err.strip()[:120]}")
+check("s pervoi popytki", "(попытка 2)" not in out, "povtor znachit, chto otvet zatjor promezhutochnyi ACK")
+check("v zhurnale vidny kuski", "часть 1/" in out and "часть 2/" in out,
+      f"tx: {[l for l in out.splitlines() if 'CMD' in l]}")
+check("vyvod sobran celikom", out.count("Q") >= 260, f"Q={out.count('Q')}")
+check("rx prinyal kuski, a ne syroy zagolovok kak komandu",
+      "часть 1/" in rx_out and "часть 2/" in rx_out,
+      f"rx: {[l for l in rx_out.splitlines() if 'CMD' in l or 'часть' in l]}")
 
 shutil.rmtree(tmp, ignore_errors=True)
 print()

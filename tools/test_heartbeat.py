@@ -21,8 +21,8 @@ import time
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
-from rdpconn import app, clipboard as cb, rx
-from rdpconn import config, framing
+from rdpconn import app, clipboard as cb, rx, tx
+from rdpconn import config, framing, segment
 
 fails = []
 
@@ -187,6 +187,52 @@ check("CMD vse ravno dooshel do handle", "ACK" in sent,
 check("eho tozhe otpravleno", "NOTE" in sent, f"sent={sent}")
 check("sobytie zachitano", counted, "inache --limit s'edalsya by nechem")
 
+print("--- 11d. povtor togo zhe CMD ne ispolnyaetsya snova ---")
+exec_args = rx.build_parser().parse_args(["--slot", "memory", "--exec"])
+exec_hb = app.Heartbeat(interval=0)
+exec_sink = Sink()
+ran = []
+real_run = rx._run_command
+
+
+class _Done:
+    returncode = 0
+    stdout = b"once\r\n"
+    stderr = b""
+
+
+def fake_run(text, timeout):
+    ran.append(text)
+    return _Done()
+
+
+rx._run_command = fake_run
+try:
+    cache = rx.ReplyCache()
+    same = framing.parse_frame(framing.cmd(0, "echo once"))
+    rx.step(exec_args, exec_sink, exec_hb, same, None, cache=cache)
+    rx.step(exec_args, exec_sink, exec_hb, same, None, cache=cache)
+    other = framing.parse_frame(framing.cmd(0, "echo other"))
+    rx.step(exec_args, exec_sink, exec_hb, other, None, cache=cache)
+finally:
+    rx._run_command = real_run
+check("odin seq s tem zhe tekstom — odin zapusk",
+      ran == ["echo once", "echo other"], str(ran))
+ack_n = sum(1 for raw in exec_sink.sent
+            if framing.parse_frame(raw).type == config.ACK)
+check("ACK ushel na kazhdyi priyom, vklyuchaya povtor", ack_n == 3, f"ack={ack_n}")
+
+print("--- 11e. ACK posle obryva vozvrashchaet tx k zhizni ---")
+back_args = tx.build_parser().parse_args(
+    ["--slot", "memory", "--ping", "10", "--wait", "1",
+     "--reply-wait", "0.05", "--retries", "1", "hi"])
+back_hb = app.Heartbeat(interval=10)
+back_hb.mark_lost()
+back_sink = Sink([framing.ack(0)])
+ok = tx.send_one(back_args, back_sink, app.SeqCounter(), "hi", back_hb)
+check("obmen podtverzhden", ok)
+check("poterya snyata kadrom ACK", back_hb.alive)
+
 print("--- 11b. sluzhebnye kadry step pogloshchaet, ne schitaya sobytiem ---")
 hb = app.Heartbeat(interval=10.0)
 sink = Sink()
@@ -236,6 +282,191 @@ check("poredel'nyy porog opoznan", hb.deadline < app.MIN_SILENCE_S,
       "inache lozhnyy obryv nikak ne otmechen")
 hb2 = app.make_heartbeat(argparse.Namespace(ping=25.0))
 check("boevoy porog normalen", hb2.deadline >= app.MIN_SILENCE_S, f"{hb2.deadline}")
+
+
+def _tx_args(wait="0.4", retries="1", reply="0.05"):
+    return tx.build_parser().parse_args(
+        ["--slot", "memory", "--ping", "0", "--wait", wait,
+         "--reply-wait", reply, "--retries", retries, "hi"])
+
+
+print("=== 13. NOTE s tem zhe seq zakryvaet popytku ===")
+# Na stende otvet priezzhal, a ACK v snimke bufera ne bylo. Zhdat ACK i
+# slat komandu snova — eto vtoraya dostavka uzhe poluchennogo otveta.
+note_sink = Sink([framing.build_frame(config.NOTE, 0, "S5-FIRST".encode("cp866"))])
+note_ok = tx.send_one(_tx_args(), note_sink, app.SeqCounter(), "echo S5-FIRST",
+                      app.Heartbeat(0))
+check("NOTE togo zhe seq zakryvaet obmen", note_ok)
+check("komanda ushla odnim kadrom", len(note_sink.sent) == 1, f"sent={len(note_sink.sent)}")
+
+print("=== 14. chuzhoy NOTE i chuzhoy ACK popytku ne zakryvayut i ne szhigayut ===")
+foreign = Sink([
+    framing.build_frame(config.NOTE, 9, b"old"),
+    framing.ack(4),
+    framing.ack(0),
+])
+foreign_ok = tx.send_one(_tx_args(wait="1"), foreign, app.SeqCounter(), "hi",
+                         app.Heartbeat(0))
+check("posle chuzhogo kadra svoy ACK eshche prinimaetsya", foreign_ok)
+only_foreign = Sink([framing.build_frame(config.NOTE, 9, b"old")])
+only_ok = tx.send_one(_tx_args(wait="0.3"), only_foreign, app.SeqCounter(), "hi",
+                      app.Heartbeat(0))
+check("odin chuzhoy NOTE ne uspekh", not only_ok)
+
+print("=== 15. komanda dlinnee kadra ne podnimaet ValueError ===")
+
+
+class ReplySink(Sink):
+    """Na kazhdyi CMD kladet ACK, a na poslednii kusok eshche i NOTE."""
+
+    def send(self, data):
+        self.sent.append(data)
+        frame = framing.parse_frame(data)
+        if frame.type != config.CMD:
+            return
+        self.inbox.append(framing.ack(frame.seq))
+        parsed = segment.unpack(frame.payload)
+        if parsed is None or parsed[1] + 1 == parsed[2]:
+            self.inbox.append(framing.build_frame(config.NOTE, frame.seq, b"DONE"))
+
+
+class CountSink(ReplySink):
+    def __init__(self):
+        super().__init__()
+        self.writes = 0
+
+    def send_many(self, frames):
+        self.writes += 1
+        for raw in frames:
+            self.send(raw)
+
+
+long_text = "echo " + ("Z" * 300)
+long_sink = CountSink()
+long_ok = tx.send_one(_tx_args(wait="1", reply="0.05"), long_sink, app.SeqCounter(),
+                      long_text, app.Heartbeat(0))
+check("oba kuska — odna zapis", long_sink.writes == 1, f"writes={long_sink.writes}")
+long_cmds = [framing.parse_frame(raw) for raw in long_sink.sent
+             if framing.parse_frame(raw).type == config.CMD]
+check("dlinnaya podtverzhdena", long_ok)
+check("kuskov bolshe odnogo", len(long_cmds) >= 2, f"cmds={len(long_cmds)}")
+check("kazhdyi kusok vlezaet v kadr",
+      all(len(frame.payload) <= config.MAX_PAYLOAD for frame in long_cmds))
+try:
+    framing.build_frame(config.CMD, 0, long_text.encode("cp866"))
+    check("syroy tekst dlinnee kadra po-prezhnemu ValueError", False)
+except ValueError:
+    check("syroy tekst dlinnee kadra po-prezhnemu ValueError", True)
+
+short_sink = ReplySink()
+short_ok = tx.send_one(_tx_args(), short_sink, app.SeqCounter(), "echo hi",
+                       app.Heartbeat(0))
+short_cmds = [framing.parse_frame(raw) for raw in short_sink.sent
+              if framing.parse_frame(raw).type == config.CMD]
+check("korotkaya — odin CMD", short_ok and len(short_cmds) == 1, f"n={len(short_cmds)}")
+check("korotkaya bez zagolovka segmenta",
+      bool(short_cmds) and not short_cmds[0].payload.startswith(segment.MAGIC))
+
+print("=== 16. priemnik sobiraet kuski i zapuskaet komandu odin raz ===")
+assembly = segment.Assembly()
+asm_cache = rx.ReplyCache()
+asm_args = rx.build_parser().parse_args(["--slot", "memory", "--exec"])
+asm_hb = app.Heartbeat(interval=0)
+asm_sink = Sink()
+ran_long = []
+
+
+def fake_long(text, timeout):
+    ran_long.append(text)
+
+    class _Out:
+        returncode = 0
+        stdout = b"once\r\n"
+        stderr = b""
+
+    return _Out()
+
+
+rx._run_command = fake_long
+try:
+    raw = long_text.encode("cp866")
+    chunks = segment.split(raw)
+    seqs = list(range(len(chunks)))
+    payloads = [segment.pack(seqs[0], i, len(chunks), chunk)
+                for i, chunk in enumerate(chunks)]
+    for seq, payload in zip(seqs, payloads):
+        frame = framing.parse_frame(framing.build_frame(config.CMD, seq, payload))
+        rx.step(asm_args, asm_sink, asm_hb, frame, None, cache=asm_cache,
+                assembly=assembly)
+    last = framing.parse_frame(framing.build_frame(config.CMD, seqs[-1], payloads[-1]))
+    rx.step(asm_args, asm_sink, asm_hb, last, None, cache=asm_cache,
+            assembly=assembly)
+    plain = framing.parse_frame(framing.cmd(9, "echo hi"))
+    rx.step(asm_args, asm_sink, asm_hb, plain, None, cache=asm_cache,
+            assembly=assembly)
+finally:
+    rx._run_command = real_run
+check("dlinnaya zapuschena odin raz i celikom",
+      ran_long == [long_text, "echo hi"], str(ran_long))
+ack_rows = [framing.parse_frame(raw) for raw in asm_sink.sent
+            if framing.parse_frame(raw).type == config.ACK]
+check("ACK na kazhdyi kusok i na povtor poslednego",
+      len(ack_rows) >= len(chunks) + 1, f"ack={len(ack_rows)} chunks={len(chunks)}")
+
+print("=== 17. kuski uzhe v ocheredi — odin otvet, bez promezhutochnogo ACK ===")
+
+
+class HoldSink(Sink):
+    def __init__(self):
+        super().__init__()
+        self.queued = []
+        self.writes = 0
+
+    def peek_pending(self):
+        return self.queued[0] if self.queued else None
+
+    def pop_pending(self):
+        return self.queued.pop(0) if self.queued else None
+
+    def send_many(self, frames):
+        self.writes += 1
+        for raw in frames:
+            self.sent.append(raw)
+
+
+hold = HoldSink()
+hold_cache = rx.ReplyCache()
+hold_asm = segment.Assembly()
+hold_ran = []
+
+
+def fake_hold(text, timeout):
+    hold_ran.append(text)
+
+    class _Out:
+        returncode = 0
+        stdout = b"joined\r\n"
+        stderr = b""
+
+    return _Out()
+
+
+rx._run_command = fake_hold
+try:
+    raw = long_text.encode("cp866")
+    chunks = segment.split(raw)
+    payloads = [segment.pack(0, i, len(chunks), chunk) for i, chunk in enumerate(chunks)]
+    first = framing.parse_frame(framing.build_frame(config.CMD, 0, payloads[0]))
+    for seq, payload in enumerate(payloads[1:], start=1):
+        hold.queued.append(framing.build_frame(config.CMD, seq, payload))
+    rx.step(asm_args, hold, asm_hb, first, None, cache=hold_cache, assembly=hold_asm)
+finally:
+    rx._run_command = real_run
+hold_types = [framing.parse_frame(raw).type for raw in hold.sent]
+check("odna zapis otveta", hold.writes == 1, f"writes={hold.writes}")
+check("komanda sobrana do zapuska", hold_ran == [long_text], str(hold_ran))
+check("v otvete est ACK i NOTE", config.ACK in hold_types and config.NOTE in hold_types,
+      str(hold_types))
 
 print("RESULT:", "FAIL\n  - " + "\n  - ".join(fails) if fails else "ALL GREEN")
 sys.exit(1 if fails else 0)

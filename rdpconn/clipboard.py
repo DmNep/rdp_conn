@@ -58,6 +58,8 @@ import secrets
 import threading
 import time
 
+from . import config
+
 # Маркер нашего кадра и версия формата в одном токене. Текст слота без него —
 # чужая копия. Кадр старого формата (XCONN1) здесь не разберётся и будет принят
 # за человеческую копию: это намеренно, молча смешивать концы разных версий
@@ -69,13 +71,10 @@ SEPARATOR = "|"
 # ячейки "id:n:b64" станет неоднозначным.
 FIELD = ":"
 
-# Сколько последних ячеек одной стороны остаётся в тексте слота. Это не
-# косметика, а условие двусторонности: приёмник обязан подтвердить CMD и тут
-# же вернуть вывод, то есть записать два кадра подряд. При единственной
-# ячейке на сторону вторая запись стёрла бы первую, не дав собеседнику её
-# увидеть — ACK терялся бы в большинстве обменов. Три ячейки хватает с
-# запасом (ACK + пара NOTE) и держат текст слота в пределах ~1 КБ.
-HISTORY_SLOTS = 3
+# Сколько последних ячеек одной стороны остаётся в тексте слота.
+# Число живёт в config: это потолок протокола, и он должен вмещать
+# весь ответ --exec, а не только ACK и пару NOTE.
+HISTORY_SLOTS = config.HISTORY_SLOTS
 
 # По умолчанию: Ctrl+Alt+F9. Дальше от стандартных связок Word/Excel/терминалов.
 DEFAULT_HOTKEY = "ctrl+alt+f9"
@@ -83,6 +82,19 @@ DEFAULT_HOTKEY = "ctrl+alt+f9"
 # Опрос буфера. 50 мс — компромисс: ниже порога ощущаемой задержки обмена
 # (кадр всё равно собирается дольше), но неBusyWait, греющий CPU.
 POLL_S = 0.05
+# Редирект сначала двигает номер буфера, а текст подставляет следом.
+# Пока номер тот же, буфер не открываем. После нового номера, если строка
+# ещё старая, сверяем её раз в секунду всё время ожидания и номер не
+# закрываем.
+STALE_RECHECK_S = 1.0
+# Один повтор той же полезной нагрузки новой ячейкой, если за это время
+# ответ не пришёл. Сам по себе повтор снимок не лечит: пока идёт серия
+# записей, ответ в слот не садится. Живой путь его не заказывает.
+NUDGE_AFTER_S = 1.0
+# Столько байт одной записи редирект увозит: первая часто остаётся на хосте,
+# повтор тех же байт новой ячейкой через секунду доходит. Крупнее этого
+# первая запись на хосте и остаётся, и тот же повтор её не вытаскивает.
+SNAPSHOT_MAX = 16384
 
 # Сколько ждать снятия паузы в send(). Столько же, сколько человек способен
 # искать в буфере нужную строку, не считая обмен мёртвым.
@@ -95,6 +107,21 @@ SEND_WAIT_S = 30.0
 # уже не расходится. После исчерпания пишем как есть: потерять свой кадр
 # хуже, чем на миг затереть чужой, — ретрансляция протокола это лечит.
 PUBLISH_TRIES = 3
+
+
+def snapshot_pieces(payload: bytes) -> list[bytes]:
+    """Нарезать нагрузку на снимки, которые редирект увозит по одному.
+
+    Следующий кусок пишут после ответа на текущий. Склеивать их в одну
+    запись нельзя: слот снова становится тем размером, который с хоста
+    не уезжает.
+    """
+    if len(payload) <= SNAPSHOT_MAX:
+        return [payload]
+    return [
+        payload[i:i + SNAPSHOT_MAX]
+        for i in range(0, len(payload), SNAPSHOT_MAX)
+    ]
 
 
 class ClipboardError(RuntimeError):
@@ -159,14 +186,17 @@ class WindowsClipboard:
         if not self._user32.IsClipboardFormatAvailable(self.CF_UNICODETEXT):
             return None
         if not self._open():
-            return None
+            # Не None: пустой слот тоже None, и вызывающий не отличил бы
+            # «буфер занят» от «текста нет». Занятый буфер надо перечитать.
+            raise ClipboardError(
+                "OpenClipboard не открылся: буфер занят другим приложением")
         try:
             handle = self._user32.GetClipboardData(self.CF_UNICODETEXT)
             if not handle:
                 return None
             pointer = self._kernel32.GlobalLock(handle)
             if not pointer:
-                return None
+                raise ClipboardError("GlobalLock не удалось")
             try:
                 return ctypes.wstring_at(pointer)
             finally:
@@ -302,6 +332,9 @@ class Hotkey:
 
     WM_HOTKEY = 0x0312
     WM_QUIT = 0x0012
+    # Без этого флага удержание клавиши шлёт WM_HOTKEY повторно, и второе
+    # сообщение снимает паузу, которую первое только что поставило.
+    MOD_NOREPEAT = 0x4000
     MODS = {"alt": 0x1, "control": 0x2, "ctrl": 0x2, "shift": 0x4, "win": 0x8}
     _ID = 0xB0BA
 
@@ -383,8 +416,22 @@ class Hotkey:
         self._tid = self._kernel32.GetCurrentThreadId()
         self._tid_ready.set()
         # Код ошибки читается немедленно: любое следующее обращение к API его затирает.
-        if not self._user32.RegisterHotKey(None, self._ID, self._mods, self._vk):
-            self._error = _gle()
+        # Сначала с MOD_NOREPEAT. Если система его не знает — без флага.
+        # Несколько попыток: после убийства прошлого rx комбинация ещё долю
+        # секунды числится занятой, и новый приёмник поднимался бы без клавиши.
+        registered = False
+        last_error = 0
+        for _ in range(8):
+            for mods in (self._mods | self.MOD_NOREPEAT, self._mods):
+                if self._user32.RegisterHotKey(None, self._ID, mods, self._vk):
+                    registered = True
+                    break
+                last_error = _gle()
+            if registered:
+                break
+            time.sleep(0.2)
+        if not registered:
+            self._error = last_error
             self._ready.set()
             return
         self._ready.set()
@@ -396,7 +443,16 @@ class Hotkey:
                 # иначе с -1 цикл превратился бы в занятое ожидание.
                 break
             if msg.message == self.WM_HOTKEY:
-                self._on_press()
+                try:
+                    self._on_press()
+                except Exception as exc:
+                    # Исключение здесь убивает поток. Следующие нажатия тогда
+                    # пропадают молча: пауза «не срабатывает», хотя процесс жив.
+                    try:
+                        from . import app
+                        app.warn(f"!! горячая клавиша: {exc}")
+                    except Exception:
+                        pass
         self._user32.UnregisterHotKey(None, self._ID)
 
     def stop(self) -> None:
@@ -445,8 +501,20 @@ class ClipboardTransport:
         # текст слота перечитывается при любом изменении номера буфера, а в
         # тексте за раз может стоять несколько чужих кадров.
         self._seen_frames = {}
-        self._seen_seq = self._store.seq()
+        self._seen_seq = 0
+        self._last_text = None
+        # Номер, который уже виден, но текст по нему ещё не прочитан.
+        self._pending_seq = None
+        self._read_at = 0.0
+        # Ячейки, которые уже лежали в слоте, — не наш пропущенный кадр:
+        # процесс только что стартовал. Иначе старый ACK с seq=0 принимается
+        # за ответ на команду, которую этот процесс ещё только пошлёт.
+        self._remember_slot()
         self._last_out = None
+        # Один отложенный повтор последней записи новыми номерами ячеек.
+        self._nudge_at = None
+        self._nudge_mine = None
+        self._nudge_once = False
         # Кадры, найденные в слоте, но ещё не отданные вызывающему: очередь,
         # потому что в merge-тексте за одну запись слота могут стоять новые
         # ячейки сразу обеих сторон.
@@ -518,12 +586,18 @@ class ClipboardTransport:
             return
         self.paused = False
         self._paused_at = None
-        self._reconcile()
-        if self._restore and self._last_out is not None and not self.busy:
-            # Занять слот можно, только если в нём по-прежнему не человеческая
-            # копия: вернуть свой кадр ценой затёртой работы пользователя —
-            # ровно то, от чего пауза и существует.
-            self._publish(self._last_out)
+        try:
+            self._reconcile()
+            if self._restore and self._last_out is not None and not self.busy:
+                # Занять слот можно, только если в нём по-прежнему не человеческая
+                # копия: вернуть свой кадр ценой затёртой работы пользователя —
+                # ровно то, от чего пауза и существует.
+                self._publish(self._last_out)
+        except ClipboardError as exc:
+            # Пауза уже снята. Ошибка чтения слота не должна убить поток
+            # клавиши: иначе следующее нажатие некому принять.
+            from . import app
+            app.warn(f"!! слот не перечитан при продолжении: {exc}")
         self._notify("resumed")
 
     def _set_busy(self, busy: bool) -> None:
@@ -547,6 +621,7 @@ class ClipboardTransport:
         text = self._store.read()
         self._pending.extend(self._accept(text))
         self._seen_seq = self._store.seq()
+        self._last_text = text
         # Занятость определяется по фактическому содержимому, а не по флагу:
         # человек мог скопировать своё уже во время паузы, и тогда restore
         # затёр бы его работу — ровно то, ради чего пауза и вводилась.
@@ -576,7 +651,37 @@ class ClipboardTransport:
     def send(self, frame_bytes: bytes) -> None:
         self._wait_running(SEND_WAIT_S)
         self._last_out = bytes(frame_bytes)
-        self._publish(self._last_out)
+        nudge = self._nudge_once
+        self._nudge_once = False
+        self._publish_many([self._last_out], keep_history=True, schedule_nudge=nudge)
+
+    def send_many(self, frames) -> None:
+        """Весь ответ одной записью буфера.
+
+        ACK и каждый NOTE отдельным SetClipboardData оставляют редиректу
+        промежуточный снимок: он уезжает на ту сторону и финальной записью
+        уже не заменяется, хвост вывода теряется. Пачка получает номера
+        сразу и ложится в слот одним текстом.
+        """
+        blob = [bytes(raw) for raw in frames]
+        if not blob:
+            return
+        self._wait_running(SEND_WAIT_S)
+        self._last_out = blob[-1]
+        # Старая история в эту запись не входит: иначе следующая команда
+        # читает NOTE предыдущей и принимает его за свой ответ.
+        nudge = self._nudge_once
+        self._nudge_once = False
+        self._publish_many(blob, keep_history=False, schedule_nudge=nudge)
+
+    def peek_pending(self):
+        """Кадр, уже разобранный из слота, но ещё не отданный наружу."""
+        return self._pending[0] if self._pending else None
+
+    def pop_pending(self):
+        if self._pending:
+            return self._pending.pop(0)
+        return None
 
     def receive(self, timeout: float):
         """Ждать кадр. Читает и в паузе тоже — см. пояснение к pause()."""
@@ -587,26 +692,83 @@ class ClipboardTransport:
             if self._pending:
                 return self._pending.pop(0)
 
+            self._maybe_nudge()
+
+            now = time.monotonic()
             seq = self._store.seq()
+            # Пока номер молчит, буфер не открываем. Редирект как раз в это
+            # время записывает ответ, и OpenClipboard ему мешает.
             if seq != self._seen_seq:
-                self._seen_seq = seq
-                text = self._store.read()
-                frames = self._accept(text)
-                if frames:
-                    self._pending.extend(frames)
-                    return self._pending.pop(0)
-                if self._human_copy(text) and self.auto_pause:
-                    # Кто-то скопировал своё: слот занят, и писать в него
-                    # сейчас — значит воевать с человеком за буфер. Приём это
-                    # не останавливает: приём ничего не затирает.
-                    self._set_busy(True)
-                if time.monotonic() >= deadline:
+                if self._pending_seq != seq:
+                    self._pending_seq = seq
+                    # Первое чтение сразу: на слоте в памяти текст уже новый,
+                    # и короткие таймауты тестов на это рассчитаны.
+                    self._read_at = now
+                if now < self._read_at:
+                    if now >= deadline:
+                        return None
+                    pause = min(self._read_at - now, deadline - now)
+                    time.sleep(pause)
+                    continue
+                try:
+                    text = self._store.read()
+                except ClipboardError:
+                    # Номер не двигаем. Иначе кадр останется в слоте, а
+                    # следующий опрос решит, что ничего не менялось.
+                    if now >= deadline:
+                        return None
+                    time.sleep(POLL_S)
+                    continue
+                # Пока строка прежняя, номер открыт. Следующий receive()
+                # продолжит ждать: ожидание длиннее одного вызова.
+                if text == self._last_text:
+                    self._read_at = now + STALE_RECHECK_S
+                else:
+                    self._seen_seq = seq
+                    self._pending_seq = None
+                    got = self._ingest(text)
+                    if got is not None:
+                        return got
+                if now >= deadline:
                     return None
+                pause = min(POLL_S, deadline - now)
+                if self._read_at > now:
+                    pause = min(pause, self._read_at - now)
+                time.sleep(pause)
                 continue
 
-            if time.monotonic() >= deadline:
+            if now >= deadline:
                 return None
-            time.sleep(POLL_S)
+            pause = min(POLL_S, deadline - now)
+            if self._nudge_at is not None:
+                pause = min(pause, max(0.0, self._nudge_at - now))
+            time.sleep(pause)
+
+    def _maybe_nudge(self) -> None:
+        """Один раз переиздать последнюю запись новыми номерами ячеек.
+
+        Тот же base64 под новым номером собеседник ещё не принимал, поэтому
+        он снова увидит кадр и ответит из кэша, не исполняя команду второй
+        раз. После этого буфер больше не трогаем: серия записей стирает ответ.
+
+        Чужой кадр уже в очереди — писать нельзя, он стёрся бы. Таймер
+        сдвигается на секунду, а не сбрасывается: иначе единственный повтор
+        пропал бы.
+        """
+        if self._nudge_at is None or time.monotonic() < self._nudge_at:
+            return
+        if self._pending:
+            self._nudge_at = time.monotonic() + NUDGE_AFTER_S
+            return
+        mine = self._nudge_mine
+        self._nudge_at = None
+        self._nudge_mine = None
+        if mine is None or self._my_history is not mine or self.paused:
+            return
+        frames = [base64.b64decode(b64) for _, b64 in reversed(mine)]
+        if not frames:
+            return
+        self._publish_many(frames, keep_history=False, schedule_nudge=False)
 
     def close(self) -> None:
         if self._hotkey is not None:
@@ -616,39 +778,81 @@ class ClipboardTransport:
     # --- внутреннее --------------------------------------------------------
 
     def _publish(self, frame_bytes: bytes) -> None:
-        """Записать свою ячейку, сохранив чужие.
+        """Записать одну свою ячейку, не стирая непрочитанные предыдущие.
+
+        На живом буфере запись после чужого снимка часто не уезжает.
+        Следующая, уже с новым номером ячейки, уезжает. Один такой повтор
+        заказывается здесь и снимается, если ответ успел прийти раньше.
+        Крупнее SNAPSHOT_MAX одной записью не пишется: следующую часть
+        вызывает уже тот, кто дождался ответа на эту.
+        """
+        if len(frame_bytes) > SNAPSHOT_MAX:
+            raise ValueError(
+                f"снимок {len(frame_bytes)} байт больше {SNAPSHOT_MAX}: "
+                "следующую часть пишут после ответа на эту"
+            )
+        self._publish_many([frame_bytes], keep_history=True, schedule_nudge=True)
+
+    def _schedule_nudge(self) -> None:
+        if not isinstance(self._store, WindowsClipboard) or self.paused:
+            return
+        self._nudge_mine = self._my_history
+        self._nudge_at = time.monotonic() + NUDGE_AFTER_S
+
+    def _publish_many(self, frames, keep_history: bool = True,
+                      schedule_nudge: bool = True) -> None:
+        """Записать свои ячейки одной операцией, сохранив чужие.
 
         Слот один, а направлений два, поэтому текст слота — это набор
-        подписанных ячеек "id:номер:base64". Заменяется только ячейка с нашим
-        id, остальные переносятся как есть: иначе ответ B затирал бы команду A
-        и обмен был бы невозможен без очереди.
+        подписанных ячеек "id:номер:base64". Заменяется только цепочка с
+        нашим id, остальные переносятся как есть: иначе ответ B затирал бы
+        команду A и обмен был бы невозможен без очереди.
 
         Номер растёт здесь, а не в send(): публикуется кадр и из send(), и из
         restore на выходе из паузы, а повторный кадр с прежним номером
         собеседник обязан пропустить как уже принятый — значит восстановленный
-        кадр обязан получить новый.
+        кадр обязан получить новый. Повторная запись той же пачки номера не
+        меняет: новый номер был бы для собеседника вторым ответом.
         """
-        self._out_seq += 1
-        # Своя очередь newest-first: шаг обмена (CMD, затем ACK, затем NOTE)
-        # это несколько записей подряд, и при единственной ячейке следующая
-        # стёрла бы предыдущую, не дав собеседнику её прочитать.
-        mine = [(self._out_seq, base64.b64encode(frame_bytes).decode("ascii"))]
-        mine.extend(self._my_history[:HISTORY_SLOTS - 1])
-        merged = None
+        fresh = []
+        for raw in frames:
+            self._out_seq += 1
+            fresh.append((self._out_seq, base64.b64encode(raw).decode("ascii")))
+        # Своя очередь newest-first. В слот входит вся пачка, а не только
+        # последняя ячейка: иначе редирект увозил бы хвост без ACK.
+        mine = list(reversed(fresh))
+        if len(mine) > HISTORY_SLOTS:
+            mine = mine[:HISTORY_SLOTS]
+        elif keep_history:
+            mine.extend(self._my_history[:HISTORY_SLOTS - len(mine)])
+        self._my_history = mine
+        head = mine[0]
+        merged = self._merge(mine, {})
+        landed = False
         for _ in range(PUBLISH_TRIES):
             # Содержимое перечитывается прямо перед сборкой текста, а не
             # берётся из памяти: окно между «увидели чужую ячейку» и «записали
             # свою» должно быть минимальным, иначе параллельная запись
             # собеседника потерялась бы.
-            mark = self._store.seq()
-            text_in = self._store.read()
+            try:
+                mark = self._store.seq()
+                text_in = self._store.read()
+            except ClipboardError:
+                continue
             # Чужие ячейки из перечитанного текста принимаем здесь же, а не
             # ждём следующего receive(): сразу после записи _seen_seq
             # подтянется на текущий номер буфера, и кадр, пришедший во время
             # нашей отправки, не был бы замечен никогда. Для двустороннего
             # обмена это потеря команды.
             self._pending.extend(self._accept(text_in))
-            merged = self._merge(mine, self._parse(text_in))
+            foreign = self._parse(text_in)
+            # На редиректе уже принятая чужая ячейка в следующей записи
+            # превращает снимок в эхо, и новый кадр до собеседника не доезжает.
+            # В памяти и в файле слот один на обоих: чужую ячейку стирать
+            # нельзя, её ещё не прочитали.
+            if isinstance(self._store, WindowsClipboard):
+                foreign = self._unseen_foreign(text_in)
+            merged = self._merge(mine, foreign)
             # Буфер обмена не даёт атомарной операции «прочитать и изменить»,
             # поэтому проверяем номер сама себя перед самой записью: если
             # собеседник успел записать между нашим чтением и сборкой текста,
@@ -656,11 +860,65 @@ class ClipboardTransport:
             # на живом буфере и терялась первая попытка CMD — наш PONG
             # накладывался на уже стёртый им же кадр. Перечитывание дешёвое
             # (GetClipboardSequenceNumber), а окно сжимается до одного вызова.
-            if self._store.seq() == mark:
+            if self._store.seq() != mark:
+                continue
+            self._store.write(merged)
+            self._note_local_write(merged)
+            landed = True
+            # Редирект иногда оставляет в слоте предыдущий снимок. Пока своей
+            # новой ячейки не видно, пишем тот же номер ещё раз: новый номер
+            # был бы для собеседника вторым кадром.
+            if self._cell_visible(head):
                 break
-        self._my_history = mine
-        self._store.write(merged)
+        else:
+            if not landed:
+                self._store.write(merged)
+                self._note_local_write(merged)
+        if schedule_nudge:
+            self._schedule_nudge()
+
+    def _note_local_write(self, merged: str) -> None:
+        """Запомнить свою запись. Ответ ждём по новому номеру, буфер не трогаем."""
         self._seen_seq = self._store.seq()
+        self._last_text = merged
+        self._pending_seq = None
+
+    def _ingest(self, text):
+        """Разобрать текст, если он отличается от уже увиденного.
+
+        Возвращает один кадр или None. None значит «кадра нет», а не ошибку:
+        тот же текст и человеческая копия — нормальный результат опроса.
+        """
+        if text == self._last_text:
+            return None
+        self._last_text = text
+        frames = self._accept(text)
+        if frames:
+            # Ответ уже у нас. Повтор своей записи стёр бы его.
+            self._nudge_at = None
+            self._pending.extend(frames)
+            return self._pending.pop(0)
+        if self.auto_pause:
+            if self._human_copy(text):
+                # Кто-то скопировал своё: слот занят, и писать в него
+                # сейчас — значит воевать с человеком за буфер. Приём это
+                # не останавливает: приём ничего не затирает.
+                self._set_busy(True)
+            elif text and text.startswith(PREFIX + SEPARATOR):
+                self._set_busy(False)
+        return None
+
+    def _unseen_foreign(self, text):
+        """Чужие ячейки, которых эта сторона ещё не принимала."""
+        kept = {}
+        for who, chain in self._parse(text or "").items():
+            if who == self.peer_id:
+                continue
+            seen = self._seen_frames.get(who, [])
+            fresh = [pair for pair in chain if pair not in seen]
+            if fresh:
+                kept[who] = fresh
+        return kept
 
     def _merge(self, mine, cells):
         """Текст слота из нашей очереди и чужих ячеек, разобранных из слота."""
@@ -746,6 +1004,38 @@ class ClipboardTransport:
         """Забыть принятые кадры: начало нового сеанса (шаг восстановления)."""
         self._seen_frames.clear()
         self._my_history = []
+
+    def _remember_slot(self) -> None:
+        """Пометить текущие чужие ячейки уже виденными, не отдавая их наружу."""
+        try:
+            text = self._store.read()
+            seq = self._store.seq()
+        except ClipboardError:
+            return
+        self._seen_seq = seq
+        self._last_text = text
+        if not text:
+            return
+        for who, chain in self._parse(text).items():
+            if who == self.peer_id:
+                continue
+            seen = self._seen_frames.setdefault(who, [])
+            for num, b64 in chain:
+                pair = (num, b64)
+                if pair not in seen:
+                    seen.append(pair)
+
+    def _cell_visible(self, head) -> bool:
+        """Видна ли в слоте только что записанная своя ячейка."""
+        try:
+            text = self._store.read()
+        except ClipboardError:
+            return False
+        num, b64 = head
+        return any(
+            n == num and b == b64
+            for n, b in self._parse(text).get(self.peer_id, ())
+        )
 
     def _human_copy(self, text) -> bool:
         """Похож ли слот на копию человека, а не на наш испорченный кадр.

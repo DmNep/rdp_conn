@@ -8,9 +8,13 @@
 команда неотличима от потерянной, поэтому --no-ack только для отладки канала.
 
 Канал двусторонний, поэтому подтверждение — не единственный ожидаемый кадр.
-Ответная сторона печатает результат NOTE и отвечает на heartbeat PONG; всё это
-печатается и попытку не тратит: посторонний ответ — часть разговора, а не его
-отсутствие. Ретранслируем мы только тишину и NAK.
+Чужой NOTE и PONG печатаются и попытку не тратят. NOTE с тем же seq, что у
+этой команды, попытку закрывает: ответ уже пришёл, и ждать отдельно
+потерянный ACK значило бы послать команду ещё раз. Ретранслируем мы только
+тишину и NAK на наш seq.
+
+Команда длиннее одного кадра режется до сборки кадра (rdpconn.segment) и
+собирается на приёмнике целиком. Кадр от этого не растёт.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ import threading
 import time
 from queue import Empty, Queue
 
-from . import app, config
+from . import app, config, framing, segment
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,84 +61,217 @@ def show_reply(frame, codec: str = config.CODEPAGE) -> None:
     app.say(f"<< {frame.type_name} seq={frame.seq} {shown!r}")
 
 
-def drain_reply(transport, wait: float, hb, codec: str = config.CODEPAGE) -> None:
-    """Дочитать ответ, пришедший сразу за ACK.
+def _back(hb) -> None:
+    """Кадр собеседника снимает объявленный обрыв.
+
+    Пока канал считается потерянным, свои PING не уходят. Если не засчитать
+    обычный ACK или NOTE, строка «снова отвечает» не появится никогда:
+    собеседник, который только исполняет команды, своих PING не шлёт.
+    """
+    if hb.note():
+        app.say(".. собеседник снова отвечает")
+
+
+class _Reader:
+    """Приём с отложенными кадрами следующих кусков.
+
+    Куски одной команды уходят одной записью буфера, и приёмник может
+    ответить на следующий кусок, пока мы ещё дочитываем предыдущий.
+    Такой кадр нельзя выбросить и нельзя оставить в общем приёме: следующий
+    кусок иначе будет ждать подтверждение, которое уже прошло мимо.
+    """
+
+    def __init__(self, transport) -> None:
+        self.transport = transport
+        self._now = []
+        self._later = []
+
+    def receive(self, timeout: float):
+        if self._now:
+            return self._now.pop(0), None
+        return app.receive_frame(self.transport, timeout)
+
+    def park(self, frame) -> None:
+        self._later.append(frame)
+
+    def release(self) -> None:
+        self._now = self._later + self._now
+        self._later = []
+
+
+def _is_later(frame, later: set) -> bool:
+    return (frame is not None and frame.seq in later
+            and frame.type in (config.ACK, config.NAK, config.NOTE))
+
+
+def drain_reply(transport, wait: float, hb, codec: str = config.CODEPAGE,
+                later: set | None = None) -> bool:
+    """Дочитать ответ, пришедший сразу за подтверждением.
 
     Порядок ответов таков, что ACK уходит раньше вывода: подтверждение нужно
     даже если исполнение зависло. Выход по первому ACK оставил бы NOTE с выводом
     в очереди транспорта, и тот припечатался бы к следующей команде. Ждём
     idle-паузу после каждого кадра, чтобы собрать пачку NOTE длинного вывода, а
     не только первый.
+
+    True — среди дочитанного был ACK. Вызвавший, который закрыл попытку по
+    NOTE, так отличает «ACK пришёл следом» от «в снимке был только ответ».
     """
+    saw_ack = False
+    reader = transport if isinstance(transport, _Reader) else None
     while True:
-        frame, err = app.receive_frame(transport, wait)
+        if reader is not None:
+            frame, err = reader.receive(wait)
+        else:
+            frame, err = app.receive_frame(transport, wait)
         if frame is None:
             if err is not None:
                 app.warn(f"?? ответ испорчен ({err}, code={err.code:#04x})")
-            return
-        if app.heartbeat_handle(hb, transport, frame):
+            return saw_ack
+        if app.heartbeat_handle(hb, transport if reader is None else reader.transport, frame):
+            continue
+        _back(hb)
+        if reader is not None and _is_later(frame, later or set()):
+            reader.park(frame)
             continue
         if frame.type in config.REPLY_TYPES:
             show_reply(frame, codec)
             continue
         # Всё остальное (чужой ACK/NAK, повтор) не наш ответ: проглотить его
         # нельзя, но и слать команду второй раз из-за него нельзя.
+        if frame.type == config.ACK:
+            saw_ack = True
         app.say(f"<< {frame}")
-        return
+        return saw_ack
+
+
+def _label(text: str) -> str:
+    """Короткий вид команды в строке журнала. Сам кадр несёт текст целиком."""
+    if len(text) <= 80:
+        return text
+    return text[:77] + "..."
+
+
+def _pieces(text: str, codec: str, counter):
+    """Кадры одной команды: (seq, payload, подпись в журнале).
+
+    Номера берутся один раз, до попыток. Повтор длинной команды обязан
+    повторить каждый кусок с тем же seq, иначе приёмник примет его за новую
+    команду и исполнит второй раз.
+    """
+    raw = text.encode(codec, errors="replace")
+    if len(raw) <= config.MAX_PAYLOAD:
+        return [(counter.take(), raw, f"{text!r}")]
+    chunks = segment.split(raw)
+    if len(chunks) > 255:
+        raise ValueError(
+            f"команда {len(raw)} байт — это {len(chunks)} кусков, "
+            "в заголовок помещается не больше 255"
+        )
+    seqs = [counter.take() for _ in chunks]
+    shown = _label(text)
+    total = len(chunks)
+    return [
+        (seqs[i], segment.pack(seqs[0], i, total, chunk),
+         f"{shown!r} часть {i + 1}/{total}")
+        for i, chunk in enumerate(chunks)
+    ]
+
+
+def _confirmed(args, reader: _Reader, hb, codec: str, seq: int,
+               reply_wait: float, later: set | None = None) -> bool:
+    """Дождаться подтверждения этого seq. False — попытку надо повторить.
+
+    Закрывают попытку ACK с нашим seq и NOTE с нашим seq. Чужой NOTE только
+    печатается. Чужой ACK попытку не сжигает: это подтверждение не этой
+    команды, и обрыв ожидания из-за него заставлял слать команду заново,
+    хотя ответ ещё был в пути.
+    """
+    timeout = app.wait_timeout(args)
+    deadline = time.monotonic() + timeout
+    held = later or set()
+    reader.release()
+    while time.monotonic() < deadline:
+        left = max(0.05, deadline - time.monotonic())
+        frame, err = reader.receive(left)
+        if err is not None:
+            app.warn(f"?? подтверждение испорчено ({err}, code={err.code:#04x})")
+            return False
+        if frame is None:
+            app.warn(f".. тишина {timeout:.2f} с, подтверждения нет")
+            return False
+        # PING собеседника обязан получить PONG даже посреди ожидания ACK:
+        # иначе он объявит нас мёртвыми ровно тогда, когда мы ждём ответа.
+        if app.heartbeat_handle(hb, reader.transport, frame):
+            continue
+        _back(hb)
+        if _is_later(frame, held):
+            reader.park(frame)
+            continue
+        if frame.type == config.ACK and frame.seq == seq:
+            app.say(f"<< ACK seq={frame.seq}")
+            drain_reply(reader, reply_wait, hb, codec, held)
+            return True
+        if frame.type == config.NAK and frame.seq == seq:
+            # Причина — байт NAK_* в payload, поэтому показываем payload как
+            # есть: угадывать по длине здесь значит молча потерять причину.
+            app.warn(f"<< NAK seq={frame.seq} payload={frame.payload.hex()} "
+                     f"— не подтверждён, повторю")
+            return False
+        if frame.type in config.REPLY_TYPES and frame.seq == seq:
+            show_reply(frame, codec)
+            if not drain_reply(reader, reply_wait, hb, codec, held):
+                app.say(f".. ответ seq={frame.seq} пришёл без ACK, попытка закрыта")
+            return True
+        if frame.type in config.REPLY_TYPES:
+            show_reply(frame, codec)
+            continue
+        if frame.type == config.PONG or frame.type == config.ACK:
+            app.say(f"<< {frame.type_name} seq={frame.seq}")
+            continue
+        app.warn(f"?? ожидался ACK seq={seq}, получен {frame}")
+        return False
+    return False
 
 
 def send_one(args, transport, counter, text: str, hb, codec: str = config.CODEPAGE) -> bool:
-    """Один обмен: CMD, затем ожидание ACK с тем же seq. True — подтверждено.
+    """Один обмен: CMD, затем подтверждение с тем же seq. True — подтверждено.
 
-    Номер берётся один раз, до цикла попыток. Ретрансмиссия обязана повторять
-    тот же seq (docs/protocol.md 4): сторона, уже исполнившая команду, на повтор
-    с тем же номером отдаёт закешированный ответ, а не исполняет её второй раз.
-    Новый номер на повторе был бы второй командой.
+    Текст длиннее кадра уходит несколькими CMD одной записью буфера. Вторая
+    запись сразу за первой на живом редиректе не доезжает: первый кусок
+    подтверждался, второй пропадал. Попытка — это вся команда. Сорвался один
+    кусок — со следующей попытки уходят все куски заново, с теми же номерами.
     """
-    timeout = app.wait_timeout(args)
-    seq = counter.take()
+    try:
+        pieces = _pieces(text, codec, counter)
+    except ValueError as exc:
+        app.warn(f"?? команда не отправлена: {exc}")
+        return False
     for attempt in range(1, args.retries + 1):
-        seq, fail = app.send_command(transport, counter, text, seq=seq, codec=codec)
+        frames = [framing.build_frame(config.CMD, seq, payload)
+                  for seq, payload, _label in pieces]
+        if hasattr(transport, "_nudge_once"):
+            # Первая запись после чужого снимка на редиректе часто пропадает.
+            # Вторая, новым номером ячейки, доходит. Ответ так не повторяем:
+            # лишняя запись стирает команду, которая уже в пути.
+            transport._nudge_once = True
+        if len(frames) == 1:
+            fail = app.send_frame(transport, frames[0])
+        else:
+            fail = app.send_frames(transport, frames)
         if fail is not None:
-            app.warn(f"?? CMD seq={seq} не отправлен: {fail}")
+            app.warn(f"?? CMD не отправлен: {fail}")
             continue
-        app.say(f">> CMD seq={seq} {text!r} (попытка {attempt})")
+        for seq, _payload, label in pieces:
+            app.say(f">> CMD seq={seq} {label} (попытка {attempt})")
         if args.no_ack:
             return True
-        # Ждём именно ACK seq. Ответные NOTE/PONG печатаются и ожидание не
-        # прерывают: попытку тратят только тишина, испорченный кадр и NAK.
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            left = max(0.05, deadline - time.monotonic())
-            frame, err = app.receive_frame(transport, left)
-            if err is not None:
-                app.warn(f"?? подтверждение испорчено ({err}, code={err.code:#04x})")
-                break
-            if frame is None:
-                app.warn(f".. тишина {timeout:.2f} с, подтверждения нет")
-                break
-            # PING собеседника обязан получить PONG даже посреди ожидания ACK:
-            # иначе он объявит нас мёртвыми ровно тогда, когда мы ждём ответа.
-            if app.heartbeat_handle(hb, transport, frame):
-                continue
-            if frame.type == config.ACK and frame.seq == seq:
-                app.say(f"<< ACK seq={frame.seq}")
-                drain_reply(transport, args.reply_wait, hb, codec)
-                return True
-            if frame.type == config.NAK and frame.seq == seq:
-                # Причина — байт NAK_* в payload, поэтому показываем payload как
-                # есть: угадывать по длине здесь значит молча потерять причину.
-                app.warn(f"<< NAK seq={frame.seq} payload={frame.payload.hex()} "
-                         f"— не подтверждён, повторю")
-                break
-            if frame.type in config.REPLY_TYPES:
-                show_reply(frame, codec)
-                continue
-            if frame.type == config.PONG:
-                app.say(f"<< PONG seq={frame.seq}")
-                continue
-            app.warn(f"?? ожидался ACK seq={seq}, получен {frame}")
-            break
+        # Ждём только последний кусок. Промежуточный ACK приёмник затирает
+        # ответом на последний: в слоте остаётся один ответ, и ждать стёртый
+        # ACK — значит не дождаться команду, которая уже исполнилась.
+        reader = _Reader(transport)
+        if _confirmed(args, reader, hb, codec, pieces[-1][0], args.reply_wait, set()):
+            return True
     return False
 
 
@@ -172,7 +309,7 @@ def idle(args, transport, hb) -> None:
     if app.heartbeat_handle(hb, transport, frame):
         return
     if frame is not None:
-        hb.note()
+        _back(hb)
         app.say(f"<< {frame}")
     app.heartbeat_tick(hb, transport)
     app.heartbeat_check(hb, transport)

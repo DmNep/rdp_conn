@@ -166,6 +166,28 @@ def send_frame(transport, frame_bytes: bytes):
         return str(exc)
 
 
+def send_frames(transport, frames):
+    """Отправить пачку. Одна запись, если транспорт умеет send_many.
+
+    None — успех, иначе текст причины. Без send_many кадры уходят по одному:
+    так устроены подставные транспорты в тестах.
+    """
+    from .clipboard import ClipboardError
+
+    many = getattr(transport, "send_many", None)
+    if many is None:
+        for raw in frames:
+            fail = send_frame(transport, raw)
+            if fail is not None:
+                return fail
+        return None
+    try:
+        many(frames)
+        return None
+    except ClipboardError as exc:
+        return str(exc)
+
+
 def send_command(transport, counter: SeqCounter, text: str,
                  seq: int | None = None, codec: str = config.CODEPAGE):
     """CMD с текстом команды.
