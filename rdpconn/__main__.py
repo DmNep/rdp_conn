@@ -7,12 +7,14 @@ from __future__ import annotations
 
 import sys
 
-from . import rx, tx
+from . import gate, rx, tx
 
 USAGE = """канал управления через буфер обмена RDP
 
     python -m rdpconn tx --peer-id A "hostname"     отправить команду
     python -m rdpconn rx --peer-id B --exec         принять и исполнить
+    python -m rdpconn gate listen --peer-id B      прокси там, где нет интернета
+    python -m rdpconn gate dial --peer-id A        выход в интернет на этой машине
     python -m rdpconn tx --help                     все ключи отправителя
 """
 
@@ -27,7 +29,9 @@ def main(argv=None) -> int:
         return tx.main(rest)
     if mode == "rx":
         return rx.main(rest)
-    print(f"не понимаю {mode!r}, нужно tx или rx\n{USAGE}", file=sys.stderr)
+    if mode == "gate":
+        return gate.main(rest)
+    print(f"не понимаю {mode!r}, нужно tx, rx или gate\n{USAGE}", file=sys.stderr)
     return 2
 
 

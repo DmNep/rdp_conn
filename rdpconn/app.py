@@ -86,6 +86,11 @@ def _pause_reporter(hotkey, pause_timeout):
                    else (f"вернётся само через {pause_timeout:.0f} с"
                          if pause_timeout else "продолжить нечем: задайте --hotkey"))
             warn(f"!! обмен на паузе: буфер отдан вам — {how}")
+        elif state == "yield":
+            say(".. буфер ваш, канал молчит. После вставки обмен через 2 с, "
+                "без вставки — через 15 с")
+        elif state == "yield_done":
+            say("<< обмен продолжен")
         elif state == "busy":
             say(".. в слоте чужая копия (обмен работает, слот не мой)")
 

@@ -475,6 +475,135 @@ class Hotkey:
         self._thread = None
 
 
+class PasteWatch:
+    """Замечает вставку, не отбирая её у программы.
+
+    Ctrl+V и Shift+Insert остаются у того окна, где их нажали: хук
+    низкого уровня только сдвигает срок, когда шлюз снова займёт слот.
+    Канал команд этот наблюдатель не включает.
+    """
+
+    WH_KEYBOARD_LL = 13
+    WM_KEYDOWN = 0x0100
+    WM_SYSKEYDOWN = 0x0104
+    WM_QUIT = 0x0012
+    VK_SHIFT = 0x10
+    VK_CONTROL = 0x11
+    VK_MENU = 0x12
+    VK_V = 0x56
+    VK_INSERT = 0x2D
+    LLKHF_UP = 0x80
+
+    class _KEY(ctypes.Structure):
+        _fields_ = [
+            ("vkCode", ctypes.c_uint),
+            ("scanCode", ctypes.c_uint),
+            ("flags", ctypes.c_uint),
+            ("time", ctypes.c_uint),
+            ("dwExtraInfo", ctypes.c_size_t),
+        ]
+
+    def __init__(self, on_paste) -> None:
+        self._on_paste = on_paste
+        self._thread = None
+        self._hook = None
+        self._tid = None
+        self._tid_ready = threading.Event()
+        self._ready = threading.Event()
+        self._error = None
+        self._callback = None
+        self._down = set()
+
+    def start(self) -> None:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        self._user32 = user32
+        self._kernel32 = kernel32
+        kernel32.GetCurrentThreadId.restype = ctypes.c_uint
+        user32.GetMessageW.restype = ctypes.c_int
+        user32.GetMessageW.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                       ctypes.c_uint, ctypes.c_uint]
+        user32.CallNextHookEx.restype = ctypes.c_ssize_t
+        user32.CallNextHookEx.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                          ctypes.c_size_t, ctypes.c_ssize_t]
+        user32.SetWindowsHookExW.restype = ctypes.c_void_p
+        user32.SetWindowsHookExW.argtypes = [ctypes.c_int, ctypes.c_void_p,
+                                             ctypes.c_void_p, ctypes.c_uint]
+        user32.UnhookWindowsHookEx.argtypes = [ctypes.c_void_p]
+        user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        user32.GetAsyncKeyState.restype = ctypes.c_short
+        user32.PostThreadMessageW.restype = ctypes.c_bool
+        user32.PostThreadMessageW.argtypes = [ctypes.c_uint, ctypes.c_uint,
+                                              ctypes.c_size_t, ctypes.c_ssize_t]
+        HOOKPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, ctypes.c_int,
+                                      ctypes.c_size_t, ctypes.c_ssize_t)
+        self._callback = HOOKPROC(self._proc)
+        self._thread = threading.Thread(target=self._run, name="paste-watch", daemon=True)
+        self._thread.start()
+        if not self._ready.wait(timeout=5.0):
+            raise ClipboardError("наблюдатель вставки не запустился")
+        if self._error is not None:
+            raise ClipboardError(f"наблюдатель вставки не встал (gle={self._error})")
+
+    def _down_mod(self, vk: int) -> bool:
+        return bool(self._user32.GetAsyncKeyState(vk) & 0x8000)
+
+    def _proc(self, nCode, wParam, lParam):
+        if nCode >= 0 and wParam in (self.WM_KEYDOWN, self.WM_SYSKEYDOWN) and lParam:
+            key = ctypes.cast(lParam, ctypes.POINTER(self._KEY)).contents
+            up = bool(key.flags & self.LLKHF_UP)
+            if up:
+                self._down.discard(key.vkCode)
+            elif key.vkCode not in self._down:
+                self._down.add(key.vkCode)
+                ctrl = self._down_mod(self.VK_CONTROL)
+                shift = self._down_mod(self.VK_SHIFT)
+                alt = self._down_mod(self.VK_MENU)
+                paste = (
+                    (key.vkCode == self.VK_V and ctrl and not alt)
+                    or (key.vkCode == self.VK_INSERT and shift and not ctrl and not alt)
+                )
+                if paste:
+                    try:
+                        self._on_paste()
+                    except Exception:
+                        pass
+        return self._user32.CallNextHookEx(self._hook, nCode, wParam, lParam)
+
+    def _run(self) -> None:
+        self._tid = self._kernel32.GetCurrentThreadId()
+        self._tid_ready.set()
+        self._hook = self._user32.SetWindowsHookExW(
+            self.WH_KEYBOARD_LL, self._callback, None, 0)
+        if not self._hook:
+            self._error = _gle()
+            self._ready.set()
+            return
+        self._ready.set()
+        msg = Hotkey._MSG()
+        while True:
+            result = self._user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if result == 0 or result < 0:
+                break
+        self._user32.UnhookWindowsHookEx(self._hook)
+        self._hook = None
+
+    def stop(self) -> None:
+        if self._thread is None:
+            return
+        if self._error is not None:
+            self._thread.join(timeout=0.5)
+            self._thread = None
+            return
+        if not self._tid_ready.wait(timeout=2.0):
+            self._thread.join(timeout=0.5)
+            self._thread = None
+            return
+        posted = self._user32.PostThreadMessageW(self._tid, self.WM_QUIT, 0, 0)
+        self._thread.join(timeout=2.0 if posted else 0.1)
+        self._thread = None
+
+
 # --- транспорт ---------------------------------------------------------------
 
 
@@ -528,6 +657,32 @@ class ClipboardTransport:
         # обрыв канала. Программа подключает сюда вывод, чтобы человек видел,
         # почему приём встал и каким клавишом его поднять.
         self.on_pause = on_pause
+        # Шлюз подставляет сюда отправку одного служебного кадра: пауза на
+        # этой стороне сама по себе не мешает собеседнику писать снимок
+        # через секунду и снова занимать слот.
+        self.before_pause = None
+        self.after_resume = None
+        # Поток, который прямо сейчас объявляет паузу, ещё имеет право
+        # записать её сигнал. Чужой поток в это окно уже писать не должен.
+        self._yield_thread = None
+        # Служебный кадр паузы держим в каждом следующем снимке, пока
+        # собеседник не запишет свой: иначе наш же ответ затирает сигнал,
+        # и вторая сторона так и остаётся на паузе.
+        self._pin_signal = None
+        self._pin_ready = False
+        self._pin_seen = {}
+        # Шлюз отдаёт слот человеку, не посылая служебный кадр: кадр стёр бы
+        # только что скопированный текст. tx/rx это не включает — иначе
+        # чужая копия навсегда лишила бы приёмник возможности подтвердить кадр.
+        self.yield_human = False
+        self.human_quiet_s = 2.0
+        self.human_cap_s = 15.0
+        self.yielding = False
+        self._human_text = None
+        self._human_until = 0.0
+        self._human_pasted = False
+        self._human_released_text = None
+        self._paste_watch = None
         self.peer = None
         self.paused = False
         # busy — слот занят человеческой копией. Отличается от paused тем, что
@@ -570,19 +725,49 @@ class ClipboardTransport:
             self.pause()
         return self.paused
 
-    def pause(self) -> None:
+    def _write_held(self) -> bool:
+        """Нельзя ли сейчас класть кадр в слот.
+
+        Поток, который объявляет паузу, дописывает её сигнал. Любой другой
+        поток в этом окне уже опоздал: его запись легла бы поверх сигнала
+        и собеседник паузу не увидел бы.
+        """
+        owner = self._yield_thread
+        me = threading.get_ident()
+        if owner not in (None, me):
+            return True
+        return self.paused and owner != me
+
+    def pause(self, *, announce: bool = True) -> None:
         """Ручная пауза (клавиша): буфер целиком отдаётся человеку.
 
         Запрещается только запись. Читать буфер по-прежнему можно: приём
         ничего не ломает, а молчание обмена неотличимо от обрыва канала.
+        announce=False — пауза пришла от собеседника, второй сигнал не шлём,
+        иначе стороны перекликались бы без конца.
         """
-        if self.paused:
+        me = threading.get_ident()
+        if self.paused or self._yield_thread not in (None, me):
             return
-        self.paused = True
-        self._paused_at = time.monotonic()
+        self._nudge_at = None
+        self._nudge_mine = None
+        self._yield_thread = me
+        try:
+            if announce and self.before_pause is not None:
+                try:
+                    self.before_pause()
+                except Exception as exc:
+                    from . import app
+                    app.warn(f"!! сигнал паузы: {exc}")
+        finally:
+            self._nudge_at = None
+            self._nudge_mine = None
+            self.paused = True
+            self._paused_at = time.monotonic()
+            self._yield_thread = None
         self._notify("paused")
 
-    def resume(self) -> None:
+    def resume(self, *, announce: bool = True) -> None:
         if not self.paused:
             return
         self.paused = False
@@ -600,6 +785,79 @@ class ClipboardTransport:
             from . import app
             app.warn(f"!! слот не перечитан при продолжении: {exc}")
         self._notify("resumed")
+        if announce and self.after_resume is not None:
+            try:
+                self.after_resume()
+            except Exception as exc:
+                from . import app
+                app.warn(f"!! сигнал продолжения: {exc}")
+
+    def note_paste(self) -> None:
+        """Вставка случилась: канал ещё немного молчит, затем возвращается.
+
+        Само сочетание клавиш буфер не трогает. Новая копия заводит срок
+        заново и длиннее: человек мог ещё не дойти до окна, куда вставляет.
+        """
+        if not self.yield_human or self.paused:
+            return
+        now = time.monotonic()
+        if not self.yielding:
+            self._human_pasted = True
+            self._human_until = now + self.human_quiet_s
+            self.yielding = True
+            self._nudge_at = None
+            self._nudge_mine = None
+            self._notify("yield")
+            return
+        self._human_pasted = True
+        self._human_until = now + self.human_quiet_s
+
+    def consider_slot(self) -> None:
+        """Снять молчание, когда срок после вставки (или без неё) вышел."""
+        if not self.yield_human or self.paused or not self.yielding:
+            return
+        if time.monotonic() >= self._human_until:
+            self._release_human()
+
+    def _hold_human(self, text: str) -> None:
+        if text == self._human_released_text and not self.yielding:
+            return
+        now = time.monotonic()
+        first = not self.yielding
+        if text != self._human_text:
+            previous = self._human_text
+            self._human_text = text
+            if previous is not None:
+                self._human_pasted = False
+                self._human_until = now + self.human_cap_s
+            elif not self._human_pasted:
+                self._human_until = now + self.human_cap_s
+        elif first:
+            self._human_until = now + self.human_cap_s
+        self.yielding = True
+        self._nudge_at = None
+        self._nudge_mine = None
+        if first:
+            self._notify("yield")
+
+    def _release_human(self) -> None:
+        if not self.yielding:
+            return
+        self._human_released_text = self._human_text
+        self.yielding = False
+        self._human_text = None
+        self._human_pasted = False
+        self._human_until = 0.0
+        self._notify("yield_done")
+
+    def _refuse_human(self, text) -> bool:
+        """Не писать поверх текста человека. False — эту запись делать можно."""
+        if not self.yield_human or not text or not self._human_copy(text):
+            return False
+        if text == self._human_released_text:
+            return False
+        self._hold_human(text)
+        return True
 
     def _set_busy(self, busy: bool) -> None:
         """Слот занят чужой копией: писать нельзя, читать можно."""
@@ -690,10 +948,22 @@ class ClipboardTransport:
         while True:
             self._expire()
 
+            if self.yield_human:
+                self.consider_slot()
+
             if self._pending:
                 return self._pending.pop(0)
 
-            self._maybe_nudge()
+            # Новая копия уже сменила номер слота. Повтор своей записи
+            # в этот же заход стёр бы её раньше, чем мы успели её прочитать.
+            defer_nudge = False
+            if self.yield_human:
+                try:
+                    defer_nudge = self._store.seq() != self._seen_seq
+                except ClipboardError:
+                    defer_nudge = False
+            if not defer_nudge:
+                self._maybe_nudge()
 
             now = time.monotonic()
             seq = self._store.seq()
@@ -756,6 +1026,10 @@ class ClipboardTransport:
         сдвигается на секунду, а не сбрасывается: иначе единственный повтор
         пропал бы.
         """
+        if self.yielding:
+            self._nudge_at = None
+            self._nudge_mine = None
+            return
         if self._nudge_at is None or time.monotonic() < self._nudge_at:
             return
         if self._pending:
@@ -772,6 +1046,9 @@ class ClipboardTransport:
         self._publish_many(frames, keep_history=False, schedule_nudge=False)
 
     def close(self) -> None:
+        if self._paste_watch is not None:
+            self._paste_watch.stop()
+            self._paste_watch = None
         if self._hotkey is not None:
             self._hotkey.stop()
             self._hotkey = None
@@ -815,6 +1092,17 @@ class ClipboardTransport:
         кадр обязан получить новый. Повторная запись той же пачки номера не
         меняет: новый номер был бы для собеседника вторым ответом.
         """
+        if self._write_held():
+            return
+        try:
+            peek = self._store.read()
+        except ClipboardError:
+            peek = None
+        if self._refuse_human(peek):
+            return
+        pin = self._pin_signal
+        if pin and pin not in frames:
+            frames = list(frames) + [pin]
         fresh = []
         for raw in frames:
             self._out_seq += 1
@@ -830,6 +1118,7 @@ class ClipboardTransport:
         head = mine[0]
         merged = self._merge(mine, {})
         landed = False
+        text_in = None
         for _ in range(PUBLISH_TRIES):
             # Содержимое перечитывается прямо перед сборкой текста, а не
             # берётся из памяти: окно между «увидели чужую ячейку» и «записали
@@ -863,8 +1152,12 @@ class ClipboardTransport:
             # (GetClipboardSequenceNumber), а окно сжимается до одного вызова.
             if self._store.seq() != mark:
                 continue
+            if self._write_held() or self._refuse_human(text_in):
+                return
             self._store.write(merged)
             self._note_local_write(merged)
+            if text_in == self._human_released_text:
+                self._human_released_text = None
             landed = True
             # Редирект иногда оставляет в слоте предыдущий снимок. Пока своей
             # новой ячейки не видно, пишем тот же номер ещё раз: новый номер
@@ -872,9 +1165,11 @@ class ClipboardTransport:
             if self._cell_visible(head):
                 break
         else:
-            if not landed:
+            if not landed and not self._write_held() and not self._refuse_human(text_in):
                 self._store.write(merged)
                 self._note_local_write(merged)
+                if text_in == self._human_released_text:
+                    self._human_released_text = None
         if schedule_nudge:
             self._schedule_nudge()
 
@@ -897,9 +1192,13 @@ class ClipboardTransport:
         if frames:
             # Ответ уже у нас. Повтор своей записи стёр бы его.
             self._nudge_at = None
+            if self.yielding and self.yield_human and not self.paused:
+                self._release_human()
             self._pending.extend(frames)
             return self._pending.pop(0)
-        if self.auto_pause:
+        if self.yield_human and self._human_copy(text):
+            self._hold_human(text)
+        elif self.auto_pause:
             if self._human_copy(text):
                 # Кто-то скопировал своё: слот занят, и писать в него
                 # сейчас — значит воевать с человеком за буфер. Приём это
@@ -997,6 +1296,12 @@ class ClipboardTransport:
                 except (binascii.Error, ValueError):
                     continue
                 self._seen_frames.setdefault(who, []).append((num, b64))
+                if self._pin_ready and self._pin_signal is not None:
+                    known = self._pin_seen.get(who, ())
+                    if (num, b64) not in known:
+                        # Собеседник уже пишет после сигнала — повторять его незачем.
+                        self._pin_signal = None
+                        self._pin_ready = False
                 self.peer = who
                 found.append(data)
         return found
