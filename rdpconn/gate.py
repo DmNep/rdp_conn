@@ -764,12 +764,14 @@ def _reap(pipes: dict[int, Pipe]) -> None:
         warm = pipe.opened and pipe.read_n > 0 and pipe.wrote_n > 0
         if now - pipe.touch <= (_WARM_S if warm else _STALL_S):
             continue
+        age = now - pipe.touch
         if warm:
             app.warn(f".. поток {pipe.sid} тихий, закрываю")
             _meter_close(pipe.sid, "тихий, закрыт")
         else:
             app.warn(f".. поток {pipe.sid} молчит, закрываю")
             _meter_close(pipe.sid, "молчит, закрыт")
+        app.trace("gate-pipe-reap", sid=pipe.sid, warm=warm, age=round(age, 2))
         _abandon(pipe)
 
 
@@ -1260,7 +1262,10 @@ def listen_loop(transport, proxy_host: str, proxy_port: int, stop, wait: float,
                 continue
             bias.note_sent(frames, yield_turn and any(_is_yield(raw) for raw in frames))
             _remember_gate(transport, frames, pipes)
+            sent_at = time.monotonic()
             fail = send_snapshot(transport, frames, limit=ceiling.cells)
+            app.trace("gate-send", side="listen", cells=len(frames),
+                      bytes=sum(len(raw) for raw in frames), fail=fail is not None)
             if not yield_turn and _backlog(pipes) > 0:
                 ceiling.arm(pipes, transport)
             if transport.yielding:
@@ -1279,8 +1284,12 @@ def listen_loop(transport, proxy_host: str, proxy_port: int, stop, wait: float,
                     pipe.end_sent = False
                 app.warn(f".. тишина шлюза {silence_wait:.1f} с, повторю снимок")
                 ceiling.observe(pipes)
+                app.trace("gate-silence", side="listen", waited=round(time.monotonic() - sent_at, 2),
+                          gap_was=round(silence_wait, 1))
                 silence_wait = min(_SILENCE_BACKOFF_MAX_S, silence_wait * 2)
                 continue
+            app.trace("gate-reply", side="listen", waited=round(time.monotonic() - sent_at, 2),
+                      cells=len(reply), bytes=sum(len(frame.payload) for frame in reply))
             silence_wait = wait
             bias.note_peer(reply)
             apply_frames(pipes, reply, dial=False, transport=transport)

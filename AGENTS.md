@@ -121,7 +121,7 @@ A: cd C:\Users\d.proskurnin\projects\rdp_conn
 | `rdpconn/framing.py` | сборка и разбор кадра, коды отказа, конструкторы кадров |
 | `rdpconn/segment.py` | команда длиннее `MAX_PAYLOAD` — кадры-кусочки `SEG1` (`docs/protocol.md` 4) |
 | `rdpconn/clipboard.py` | слот: маркер `RDP1`, история ячеек, занятость, пауза, горячая клавиша |
-| `rdpconn/app.py` | аргументы, обмен, `SeqCounter`, heartbeat, вывод |
+| `rdpconn/app.py` | аргументы, обмен, `SeqCounter`, heartbeat, вывод, `trace()` (`RDPCONN_TRACE`, общий для `gate`/`coder`) |
 | `rdpconn/tune.py` | замер паузы повтора снимка, рабочий запас (`PACE_MARGIN`) |
 | `rdpconn/tx.py` / `rdpconn/rx.py` | два конца канала команд |
 | `rdpconn/gate.py` | HTTP-прокси через буфер: `listen`/`dial`, магия `G1`, динамический потолок снимка |

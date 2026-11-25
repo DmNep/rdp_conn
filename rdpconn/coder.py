@@ -41,23 +41,15 @@ FLAG_WINDOW = 0x02
 FLAG_ALONE = 0x04
 
 _TURN = 0
-_TRACE_FILE = threading.Lock()
 
 
 def trace(stage: str, **fields) -> None:
-    """Строка журнала в файл. В буфер не пишется."""
-    path = os.environ.get("RDPCONN_TRACE")
-    if not path:
-        return
-    row = {"t": round(time.time(), 3), "turn": _TURN, "stage": stage}
-    row.update(fields)
-    try:
-        line = json.dumps(row, ensure_ascii=False) + "\n"
-        with _TRACE_FILE:
-            with open(path, "a", encoding="utf-8") as handle:
-                handle.write(line)
-    except OSError:
-        return
+    """Строка журнала в app.trace(), с номером хода этого модуля.
+
+    Механика (путь RDPCONN_TRACE, формат JSON, блокировка) — общая с gate.py,
+    живёт в app.py; turn — только здесь, это понятие именно обмена с моделью.
+    """
+    app.trace(stage, turn=_TURN, **fields)
 
 
 def _clip(text: str, limit: int = 400) -> str:

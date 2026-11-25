@@ -15,7 +15,10 @@ CRC даёт FrameError — на него положен NAK, и он тоже �
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import sys
+import threading
 import time
 
 from . import config, framing
@@ -52,6 +55,9 @@ def add_channel_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--wait", type=float, default=CLIPBOARD_WAIT_S,
                    help=f"сколько секунд ждать ответа (по умолчанию "
                         f"{CLIPBOARD_WAIT_S:g})")
+    p.add_argument("--log-time", action="store_true",
+                   help="метка времени перед каждой строкой вывода "
+                        "(для разбора захваченного лога живого прогона позже)")
 
 
 class Channel:
@@ -102,6 +108,7 @@ def open_channel(args: argparse.Namespace) -> Channel:
     """Собрать канал по аргументам."""
     from .clipboard import ClipboardError, ClipboardTransport, open_store
 
+    set_timestamps(getattr(args, "log_time", False))
     try:
         store = open_store(args.slot)
         transport = ClipboardTransport(
@@ -453,6 +460,20 @@ def heartbeat_check(hb, transport) -> bool:
 
 # --- вывод -------------------------------------------------------------------
 
+_log_time = False
+
+
+def set_timestamps(enabled: bool) -> None:
+    """--log-time: метка времени перед каждой строкой вывода.
+
+    Нужно для разбора уже захваченного лога живого прогона: say()/warn() сами
+    по себе времени не несли, и посчитать длительность между двумя строками
+    (скажем, между «тишина шлюза» и следующей) можно было только по mtime
+    всего файла целиком, не по отдельной строке.
+    """
+    global _log_time
+    _log_time = enabled
+
 
 def say(text: str) -> None:
     """Печать в кодировке консоли без UnicodeEncodeError."""
@@ -464,6 +485,8 @@ def warn(text: str) -> None:
 
 
 def _emit(stream, text: str) -> None:
+    if _log_time:
+        text = f"{time.strftime('%H:%M:%S')}.{int(time.time() * 1000) % 1000:03d} {text}"
     encoding = getattr(stream, "encoding", None) or "utf-8"
     data = (text + "\n").encode(encoding, errors="replace")
     buf = getattr(stream, "buffer", None)
@@ -473,3 +496,30 @@ def _emit(stream, text: str) -> None:
     else:
         stream.write(data.decode(encoding, errors="replace"))
         stream.flush()
+
+
+# --- структурный лог ----------------------------------------------------------
+
+_trace_lock = threading.Lock()
+
+
+def trace(stage: str, **fields) -> None:
+    """Строка JSON в файл RDPCONN_TRACE, если он задан. В буфер не пишется.
+
+    Общий механизм для coder/gate: человекочитаемый say()/warn() годится
+    смотреть глазами, но не считать по нему процентили задержки. Один файл на
+    процесс (переменная окружения одна), поэтому stage начинают с источника
+    (coder-.../gate-...), чтобы не путать события разных модулей при разборе.
+    """
+    path = os.environ.get("RDPCONN_TRACE")
+    if not path:
+        return
+    row = {"t": round(time.time(), 3), "stage": stage}
+    row.update(fields)
+    try:
+        line = json.dumps(row, ensure_ascii=False) + "\n"
+        with _trace_lock:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(line)
+    except OSError:
+        return
