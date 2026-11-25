@@ -27,14 +27,25 @@ let waiter: ((line: string) => void) | null = null
 
 function guest(): ChildProcessWithoutNullStreams {
 	if (child && !child.killed && child.exitCode === null) return child
-	child = spawn(PYTHON, ["-m", "rdpconn", "guest", "--feed", "model", "--peer-id", "B", "--wait", "45"], {
+	queue.length = 0
+	const proc = spawn(PYTHON, ["-m", "rdpconn", "guest", "--feed", "model", "--peer-id", "B", "--wait", "45"], {
 		cwd: ROOT,
 		env: { ...process.env, PYTHONPATH: ROOT, PYTHONIOENCODING: "utf-8" },
 		stdio: ["pipe", "pipe", "pipe"],
 		windowsHide: true,
 	})
-	lines = readline.createInterface({ input: child.stdout })
+	proc.stderr.resume()
+	proc.on("exit", () => {
+		// Выход предыдущего процесса не должен срывать уже новый запрос.
+		if (child !== proc || !waiter) return
+		const next = waiter
+		waiter = null
+		next(JSON.stringify({ error: "coder closed" }))
+	})
+	child = proc
+	lines = readline.createInterface({ input: proc.stdout })
 	lines.on("line", (line) => {
+		if (child !== proc) return
 		if (waiter) {
 			const next = waiter
 			waiter = null

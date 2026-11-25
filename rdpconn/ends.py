@@ -57,6 +57,11 @@ def main(role: str, argv=None) -> int:
     if role == "guest" and args.monitor:
         app.warn("страница только на хосте, на гуесте её не поднимаю")
         args.monitor = ""
+    if role == "guest" and not coder.claim_guest():
+        app.warn("кодер уже в сессии")
+        return 0
+    if role == "guest":
+        coder.watch_parent()
     try:
         channel = app.open_channel(args)
     except app.UsageError as exc:

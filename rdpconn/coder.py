@@ -14,9 +14,13 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
+import hashlib
 import json
+import os
 import sys
 import threading
+from ctypes import wintypes
 import time
 import urllib.error
 import urllib.request
@@ -35,6 +39,47 @@ FLAG_ZLIB = 0x01
 FLAG_WINDOW = 0x02
 # Окно само по себе законченный кусок ответа, его можно отдать сразу.
 FLAG_ALONE = 0x04
+
+_TURN = 0
+_TRACE_FILE = threading.Lock()
+
+
+def trace(stage: str, **fields) -> None:
+    """Строка журнала в файл. В буфер не пишется."""
+    path = os.environ.get("RDPCONN_TRACE")
+    if not path:
+        return
+    row = {"t": round(time.time(), 3), "turn": _TURN, "stage": stage}
+    row.update(fields)
+    try:
+        line = json.dumps(row, ensure_ascii=False) + "\n"
+        with _TRACE_FILE:
+            with open(path, "a", encoding="utf-8") as handle:
+                handle.write(line)
+    except OSError:
+        return
+
+
+def _clip(text: str, limit: int = 400) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "…"
+
+
+def _users(obj: dict) -> list[str]:
+    found = []
+    for message in obj.get("messages") or []:
+        if (message.get("role") or "") != "user":
+            continue
+        content = message.get("content") or ""
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False)
+        found.append(_clip(content, 300))
+    return found
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
 _HEAD = 8
 CHUNK = config.MAX_PAYLOAD - _HEAD
 CELLS = GATE_CELLS_MIN
@@ -134,8 +179,9 @@ class Link:
                 return
         raise CoderError("снимок не подтвердили")
 
-    def _write(self, body: bytes, last_op: int, flags_base: int) -> None:
+    def _write(self, body: bytes, last_op: int, flags_base: int) -> int:
         mid = self._next_mid()
+        self._sent_mid = mid
         windows = self._windows(mid, body, last_op, flags_base)
         sizes = [sum(len(frame) for frame in window) for window in windows]
         rest = sum(sizes)
@@ -145,14 +191,47 @@ class Link:
             self._send(window)
             if index + 1 < len(windows):
                 self._wait_ack(mid)
+        return len(windows)
 
     def write_request(self, obj: dict) -> None:
-        raw = zlib.compress(json.dumps(obj, ensure_ascii=False).encode("utf-8"))
-        self._write(raw, OP_END, FLAG_ZLIB)
+        plain = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        raw = zlib.compress(plain)
+        windows = self._write(raw, OP_END, FLAG_ZLIB)
+        # Пока писали запрос, в очередь мог попасть повтор прошлого ответа:
+        # хост переиздает его новым номером ячейки уже после того, как гость
+        # этот ответ прочитал. К новому запросу он не относится.
+        pending = getattr(self.transport, "_pending", None)
+        if pending:
+            pending.clear()
+        system = obj.get("system") or ""
+        trace(
+            "guest-sent-request",
+            plain=len(plain),
+            zlib=len(raw),
+            windows=windows,
+            system=len(system),
+            system_hash=_digest(system) if system else "",
+            users=_users(obj),
+        )
 
     def write_reply(self, kind: str, text: str, final: bool) -> None:
-        raw = zlib.compress(json.dumps({"k": kind, "s": text}, ensure_ascii=False).encode("utf-8"))
-        self._write(raw, OP_END if final else OP_PIECE, FLAG_ZLIB | FLAG_ALONE)
+        packed = json.dumps({"k": kind, "s": text}, ensure_ascii=False).encode("utf-8")
+        raw = zlib.compress(packed)
+        windows = self._write(raw, OP_END if final else OP_PIECE, FLAG_ZLIB | FLAG_ALONE)
+        trace(
+            "host-sent-reply",
+            kind=kind,
+            final=final,
+            n=len(text),
+            text=_clip(text),
+            plain=len(packed),
+            zlib=len(raw),
+            windows=windows,
+        )
+        # Следующий снимок иначе затирает этот, гость видит только хвост.
+        if not final:
+            self._wait_ack(self._sent_mid)
+            trace("host-got-ack", mid=self._sent_mid)
 
     def write_error(self, text: str) -> None:
         # Ошибка — один кадр. Длинный текст режется: иначе середина уехала бы как кусок ответа.
@@ -160,7 +239,9 @@ class Link:
 
     def _read_window(self, timeout: float | None):
         deadline = None if timeout is None else time.monotonic() + timeout
-        parts: list[bytes] = []
+        parts: dict[int, bytes] = {}
+        ended = False
+        end_op = end_flags = end_mid = 0
         while True:
             if deadline is None:
                 left = 5.0
@@ -178,10 +259,28 @@ class Link:
             parsed = _note(raw)
             if parsed is None or parsed[0] == OP_ACK:
                 continue
-            op, flags, mid, _part, body = parsed
-            parts.append(body)
-            if flags & FLAG_WINDOW or op in (OP_END, OP_ERR):
-                return op, flags, mid, b"".join(parts)
+            op, flags, mid, part, body = parsed
+            parts[part] = body
+            # Конец мог прийти раньше начала. Собираем сплошной ряд с нуля.
+            if op in (OP_END, OP_ERR) or flags & FLAG_WINDOW:
+                ended = True
+                end_op, end_flags, end_mid = op, flags, mid
+            if not ended or not parts:
+                continue
+            low = min(parts)
+            high = max(parts)
+            if any(index not in parts for index in range(low, high + 1)):
+                continue
+            blob = b"".join(parts[index] for index in range(low, high + 1))
+            trace(
+                "window",
+                op=end_op,
+                flags=end_flags,
+                parts=len(parts),
+                n=len(blob),
+                head=blob[:8].hex(),
+            )
+            return end_op, end_flags, end_mid, blob
 
     def _ack(self, mid: int) -> None:
         self._queue = 0
@@ -206,9 +305,23 @@ class Link:
             blob = b"".join(chunks)
             if op == OP_ERR:
                 raise CoderError(blob.decode("utf-8", "replace"))
-            if flags & FLAG_ZLIB and blob:
-                blob = zlib.decompress(blob)
-            return json.loads(blob.decode("utf-8"))
+            try:
+                if flags & FLAG_ZLIB and blob:
+                    blob = zlib.decompress(blob)
+                obj = json.loads(blob.decode("utf-8"))
+            except (zlib.error, json.JSONDecodeError) as exc:
+                raise CoderError(f"запрос не разобрался: {exc}") from exc
+            global _TURN
+            _TURN += 1
+            system = obj.get("system") or ""
+            trace(
+                "host-unpacked-request",
+                plain=len(blob),
+                system=len(system),
+                system_hash=_digest(system) if system else "",
+                users=_users(obj),
+            )
+            return obj
 
     def read_reply(self):
         """Куски ответа: пары (kind, text). Конец сообщения куском не является."""
@@ -216,18 +329,24 @@ class Link:
             op, flags, mid, body = self._read_window(self.reply_wait)
             if op == OP_ERR:
                 raise CoderError(body.decode("utf-8", "replace"))
-            if flags & FLAG_ZLIB and body:
-                body = zlib.decompress(body)
-            text = ""
-            kind = "text"
-            if body:
-                obj = json.loads(body.decode("utf-8"))
-                kind = obj.get("k") or "text"
-                text = obj.get("s") or ""
+            try:
+                if flags & FLAG_ZLIB and body:
+                    body = zlib.decompress(body)
+                text = ""
+                kind = "text"
+                if body:
+                    obj = json.loads(body.decode("utf-8"))
+                    kind = obj.get("k") or "text"
+                    text = obj.get("s") or ""
+            except (zlib.error, json.JSONDecodeError) as exc:
+                raise CoderError(f"ответ не разобрался: {exc}") from exc
+            trace("guest-unpacked-reply", kind=kind, n=len(text), text=_clip(text), final=op != OP_PIECE)
+            # Финальный ответ тоже подтверждаем. Иначе хост через 0,94 с
+            # переиздаст его новым номером, и следующий запрос примет копию за свежий ответ.
+            self._ack(mid)
             if op == OP_PIECE:
                 if text:
                     yield kind, text
-                self._ack(mid)
                 continue
             if text:
                 yield kind, text
@@ -281,38 +400,53 @@ def iter_llama(upstream: str, model: str, messages: list[dict], timeout: float):
 def serve(link: Link, complete, once: bool = False) -> None:
     """Принять запрос, отдать текст complete() снимками."""
     while True:
-        req = link.read_request()
+        try:
+            req = link.read_request()
+        except CoderError as exc:
+            app.warn(f"!! кодер: {exc}")
+            try:
+                link.write_error(str(exc))
+            except Exception as second:
+                app.warn(f"!! ошибку не доставили: {second}")
+            continue
         if req is None:
             continue
         try:
             pending: list[str] = []
             kind_now = "text"
-            last = time.monotonic()
             # Пока модель считает запрос, ответа ещё нет. Без кадра гость
             # через reply_wait решает, что окно не доехало.
             stop_beat = threading.Event()
+            send_lock = threading.Lock()
 
-            def beat() -> None:
-                while not stop_beat.wait(10):
-                    try:
-                        link.transport.send(framing.build_frame(config.PING, 0, b""))
-                    except Exception:
+            def beat_locked() -> None:
+                while not stop_beat.is_set():
+                    with send_lock:
+                        if stop_beat.is_set():
+                            return
+                        try:
+                            link.transport._nudge_once = True
+                            link.transport.send(framing.build_frame(config.PING, 0, b""))
+                        except Exception:
+                            return
+                    if stop_beat.wait(10):
                         return
 
-            beater = threading.Thread(target=beat, name="rdpconn-beat", daemon=True)
+            beater = threading.Thread(target=beat_locked, name="rdpconn-beat", daemon=True)
             beater.start()
 
             def flush(final: bool) -> None:
-                nonlocal pending, last
-                if not stop_beat.is_set():
-                    stop_beat.set()
-                    beater.join(timeout=3)
-                text = "".join(pending)
-                pending = []
-                last = time.monotonic()
-                if not text and not final:
-                    return
-                link.write_reply(kind_now, text, final)
+                nonlocal pending
+                stop_beat.set()
+                with send_lock:
+                    link.transport._nudge_at = None
+                    link.transport._nudge_mine = None
+                    text = "".join(pending)
+                    pending = []
+                    if not text and not final:
+                        return
+                    trace("model-to-host", kind=kind_now, final=final, n=len(text), text=_clip(text))
+                    link.write_reply(kind_now, text, final)
 
             try:
                 for kind, text in complete(messages_of(req)):
@@ -321,7 +455,10 @@ def serve(link: Link, complete, once: bool = False) -> None:
                     kind_now = kind
                     pending.append(text)
                     blob = zlib.compress("".join(pending).encode("utf-8"))
-                    if len(blob) >= (link.cells * CHUNK) // 2 or time.monotonic() - last >= 0.35:
+                    # Короткий ответ уходит одним снимком в конце. Промежуточный
+                    # снимок через долю секунды затирал сам себя: модель успевала
+                    # дописать хвост раньше, чем гость прочитывал начало.
+                    if len(blob) >= (link.cells * CHUNK) // 2:
                         flush(False)
                 flush(True)
             finally:
@@ -342,6 +479,7 @@ def ask(link: Link, obj: dict):
 
 
 def _emit(kind: str, text: str) -> None:
+    trace("guest-to-cline", kind=kind, n=len(text), text=_clip(text))
     if kind == "reasoning":
         line = {"reasoning": text}
     else:
@@ -350,20 +488,99 @@ def _emit(kind: str, text: str) -> None:
     sys.stdout.flush()
 
 
+def claim_guest() -> bool:
+    """В сессии один писатель буфера. Второй ждёт, пока предыдущий процесс отпустит слот."""
+    if sys.platform != "win32":
+        return True
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    kernel32.CreateMutexW.restype = wintypes.HANDLE
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    for _ in range(20):
+        ctypes.set_last_error(0)
+        handle = kernel32.CreateMutexW(None, False, "Local\\rdpconn-guest")
+        if not handle:
+            return True
+        # 183 — мьютекс ещё у живого процесса. 128 — хозяин умер, мьютекс наш.
+        if ctypes.get_last_error() not in (183,):
+            global _GUEST_MUTEX
+            _GUEST_MUTEX = handle
+            return True
+        kernel32.CloseHandle(handle)
+        time.sleep(0.25)
+    return False
+
+
+_GUEST_MUTEX = None
+
+
+def watch_parent() -> None:
+    """Родитель Cline умер, а гость ещё ждёт кадр и держит слот. Тогда выходим."""
+    if sys.platform != "win32":
+        return
+
+    def run() -> None:
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        ntdll = ctypes.WinDLL("ntdll")
+
+        class INFO(ctypes.Structure):
+            _fields_ = [
+                ("ExitStatus", ctypes.c_long),
+                ("PebBaseAddress", ctypes.c_void_p),
+                ("AffinityMask", ctypes.c_size_t),
+                ("BasePriority", ctypes.c_long),
+                ("UniqueProcessId", ctypes.c_void_p),
+                ("InheritedFromUniqueProcessId", ctypes.c_void_p),
+            ]
+
+        info = INFO()
+        status = ntdll.NtQueryInformationProcess(
+            kernel32.GetCurrentProcess(), 0, ctypes.byref(info), ctypes.sizeof(info), None
+        )
+        if status != 0:
+            return
+        parent = ctypes.cast(info.InheritedFromUniqueProcessId, ctypes.c_void_p).value or 0
+        if parent <= 4:
+            return
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.OpenProcess.restype = wintypes.HANDLE
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        handle = kernel32.OpenProcess(0x00100000, False, parent)
+        if not handle:
+            os._exit(0)
+        kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
+        os._exit(0)
+
+    threading.Thread(target=run, name="rdpconn-parent", daemon=True).start()
+
+
 def guest_loop(link: Link, once_path: str | None) -> int:
     from .statcell import ERR_CODER, ERR_JSON, FEED_MODEL, attach_guest
 
     board = attach_guest(link.transport, FEED_MODEL)
     app.warn("кодер в сессии: текст в буфер, порт не слушаю")
+    if not os.environ.get("RDPCONN_TRACE") and os.path.isdir(r"C:\Users\rdp\setup"):
+        os.environ["RDPCONN_TRACE"] = r"C:\Users\rdp\setup\trace-guest.jsonl"
 
     def run(obj: dict) -> None:
+        global _TURN
+        _TURN += 1
+        trace(
+            "cline-to-guest",
+            plain=len(json.dumps(obj, ensure_ascii=False)),
+            system=len(obj.get("system") or ""),
+            users=_users(obj),
+        )
         try:
             for kind, text in ask(link, obj):
                 _emit(kind, text)
+            trace("guest-to-cline", done=True)
             sys.stdout.write('{"done":true}\n')
             sys.stdout.flush()
         except CoderError as exc:
             board.fail(ERR_CODER)
+            trace("guest-to-cline", error=str(exc))
             sys.stdout.write(json.dumps({"error": str(exc)}, ensure_ascii=False) + "\n")
             sys.stdout.flush()
 
@@ -405,6 +622,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+    if args.mode == "guest" and not claim_guest():
+        app.warn("кодер уже в сессии")
+        return 0
+    if args.mode == "guest":
+        watch_parent()
     try:
         channel = app.open_channel(args)
     except app.UsageError as exc:

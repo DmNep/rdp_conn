@@ -997,12 +997,13 @@ class ClipboardTransport:
 
             # Новая копия уже сменила номер слота. Повтор своей записи
             # в этот же заход стёр бы её раньше, чем мы успели её прочитать.
+            # Это не только пауза под человека: подтверждение гостя так же
+            # затирало уже лежащий в слоте хвост ответа.
             defer_nudge = False
-            if self.yield_human:
-                try:
-                    defer_nudge = self._store.seq() != self._seen_seq
-                except ClipboardError:
-                    defer_nudge = False
+            try:
+                defer_nudge = self._store.seq() != self._seen_seq
+            except ClipboardError:
+                defer_nudge = False
             if not defer_nudge:
                 self._maybe_nudge()
 
