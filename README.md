@@ -84,6 +84,53 @@ python -m rdpconn tx --peer-id A --repl
 заметит человеческую копию, скажет о ней, но подтверждение всё равно отправит.
 Буфер отдать целиком можно только клавишей.
 
+## Шлюз в интернет и локальная модель
+
+Поверх того же буфера и того же кадра `NOTE` (раскладка не меняется, своя
+магия внутри payload) живут ещё четыре режима — одновременно с `tx`/`rx` их
+не запускают, слот один:
+
+```text
+python -m rdpconn gate listen --peer-id B    прокси там, где нет интернета
+python -m rdpconn gate dial --peer-id A      выход в интернет на этой машине
+python -m rdpconn coder host --peer-id A     текст локальной модели на этой машине
+python -m rdpconn coder guest --peer-id B    тот же текст для Cline в сессии
+python -m rdpconn host --feed model          то же, что coder host, плюс страница статистики
+python -m rdpconn guest --feed model         то же, что coder guest, одна роль на запуск
+python -m rdpconn host --feed net            то же, что gate dial
+python -m rdpconn guest --feed net           то же, что gate listen, прокси только на 127.0.0.1
+python -m rdpconn monitor                    смотреть слот с этой машины, не записывая его
+```
+
+`gate` — HTTP-прокси через буфер: `listen` на машине без сети поднимает
+локальный прокси (по умолчанию `127.0.0.1:8079`), программа (Кода, VS Code)
+указывает его в `requestOptions.proxy`; `dial` на машине с интернетом
+открывает обычный TCP и возвращает ответ. Описано в
+[docs/protocol.md](docs/protocol.md), разделы 10 и 13.
+
+`coder` — текст локальной модели через тот же буфер, без HTTP и без порта:
+`host` рядом с моделью говорит с OpenAI-совместимым сервером, `guest` в
+сессии отдаёт тот же текст построчным JSON на stdin/stdout — на этом держится
+провайдер Cline, [cline/rdpconnHandler.ts](cline/rdpconnHandler.ts).
+
+`host`/`guest --feed model|net` — тот же `coder`/`gate` одним входом, плюс у
+`host` веб-страница статуса (по умолчанию `127.0.0.1:8078`, `--monitor ""`
+выключает). Отдельная команда `monitor` поднимает такую же страницу, ничего
+не пишет в слот и не мешает `coder`/`gate` на второй машине.
+
+`coder`, `host`/`guest` и `monitor` не описаны в `docs/protocol.md` — спека
+сейчас покрывает только `tx`/`rx`/`gate`.
+
+| Флаг | Где | Назначение |
+|---|---|---|
+| `--feed model\|net` | `host`/`guest` | режим: текст модели или интернет (обязателен) |
+| `--upstream URL` | `host`, модель | OpenAI-совместимый адрес модели на этой машине (по умолчанию `http://127.0.0.1:8080/v1`) |
+| `--model NAME` | `host`, модель | имя модели в запросе; пусто — как решит сервер |
+| `--once FILE` | `guest`, модель | один запрос из JSON-файла и выход, без REPL |
+| `--cells N` | модель | ячеек данных в снимке кодера |
+| `--proxy HOST:PORT` | `gate`/`guest --feed net` | локальный прокси, только `127.0.0.1` (по умолчанию `127.0.0.1:8079`) |
+| `--monitor HOST:PORT` | `gate`/`host` | страница статистики, только `127.0.0.1`; пусто — не поднимать |
+
 ## Проверка без второй машины
 
 `--slot file:PATH` заменяет буфер обмена файлом, и оба конца запускаются на одной
@@ -95,13 +142,21 @@ python tools/test_frames.py      # кадр, CRC, разбор, точка вх�
 python tools/test_clipboard.py   # слот: маркер, история, пауза, занятость
 python tools/test_heartbeat.py   # PING/PONG, молчание, возврат после обрыва
 python tools/test_duplex.py      # tx и rx двумя процессами через один слот
+python tools/test_gate.py        # прокси через буфер: listen/dial
+python tools/test_coder.py       # текст модели через буфер: host/guest
+python tools/test_statcell.py    # служебная ячейка статистики гуеста
+python tools/test_monitor.py     # чтение слота без записи
+python tools/test_tune.py        # замер паузы повтора и рабочий запас
+python tools/test_ceiling.py     # потолок снимка без буфера
 python tools/bench_speed.py --win     # скорость: кадр/с, байт/с, задержка шага
 python tools/bench_speed.py --rtt-only  # задержка шага, без дочерних процессов
 python tools/bench_speed.py --remote    # бой: rx на второй машине, виден редирект
 python tools/bench_speed.py --bulk      # латентность или пропускная способность
 ```
 
-Первые четыре — скрипты без зависимостей, завершаются `RESULT: ALL GREEN`.
+Первые десять — скрипты без зависимостей, заканчиваются строкой с `ALL GREEN`
+(у части — `RESULT: ALL GREEN`, у части просто `ALL GREEN`, точный префикс не
+единый).
 
 ### Замер в бою
 
@@ -176,11 +231,19 @@ A: python tools/bench_speed.py --bulk --bulk-wait 60
 | `rdpconn/config.py` | значения протокола: единственный источник истины |
 | `rdpconn/crc.py` | CRC-16/CCITT-FALSE |
 | `rdpconn/framing.py` | сборка и разбор кадра, коды отказа |
+| `rdpconn/segment.py` | команда длиннее кадра — кадры-кусочки `SEG1` |
 | `rdpconn/clipboard.py` | слот: маркер, история, занятость, пауза, горячая клавиша |
 | `rdpconn/app.py` | аргументы, обмен, heartbeat, вывод |
+| `rdpconn/tune.py` | замер паузы повтора снимка, рабочий запас |
 | `rdpconn/tx.py` | отправитель |
 | `rdpconn/rx.py` | приёмник |
-| `docs/protocol.md` | спецификация канала |
+| `rdpconn/gate.py` | HTTP-прокси через буфер: `listen`/`dial` |
+| `rdpconn/coder.py` | текст локальной модели через буфер: `host`/`guest` |
+| `rdpconn/ends.py` | общий запуск `host`/`guest --feed model\|net` |
+| `rdpconn/statcell.py` | служебная ячейка статистики гуеста |
+| `rdpconn/monitor.py` | веб-страница статуса слота, только читает |
+| `cline/rdpconnHandler.ts` | провайдер Cline: модель через `coder guest` |
+| `docs/protocol.md` | спецификация канала (`tx`/`rx`/`gate`) |
 | `tools/` | проверки без второй машины |
 | `tools/make_portable.py` | архив для машины без интернета |
 

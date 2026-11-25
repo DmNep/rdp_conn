@@ -19,6 +19,26 @@
 спецификацией считается ошибкой кода. Номера разделов спеки используются в
 комментариях исходников (`docs/protocol.md 4`), их менять нельзя.
 
+Поверх этого же слота и формата кадра `NOTE` выросли дополнительные конечные
+точки — тот же буфер несёт не только команды:
+
+- **`gate` (listen/dial)** — HTTP-прокси через буфер: машина без сети слушает
+  локальный прокси, машина с сетью выпускает байты в обычный TCP. Раскладка
+  кадра не меняется, своя магия `G1` живёт внутри `NOTE`. Описано в
+  `docs/protocol.md` 10 и 13 (динамический потолок снимка).
+- **`coder` (host/guest)** — текст локальной модели через тот же буфер, без
+  HTTP и без порта; магия `C1`. На этом держится провайдер Cline
+  (`cline/rdpconnHandler.ts`).
+- **`host`/`guest` с `--feed model|net`** — тонкая обёртка над `coder`/`gate`:
+  одна роль на запуск, плюс страница статистики у `host` (магия ячейки `S1`,
+  `rdpconn/statcell.py`).
+- **`monitor`** — читает слот с этой машины и ничего в него не пишет; веб-морда
+  для `host`/`gate --monitor`.
+
+`coder`/`host`/`guest`/`monitor` **не описаны в `docs/protocol.md`** (там пока
+только `tx`/`rx`/`gate`) — расхождение документа и кода здесь не ошибка кода,
+а то, что спека не дошла до этого слоя; не чинить молча, уточнять у владельца.
+
 ## 2. Решения владельца (зафиксированы, не пересматривать без запроса)
 
 - **16.10.2026. Ничего не релизим.** Никаких `git init`, тегов, push и выкладок
@@ -75,18 +95,28 @@ A: cd C:\Users\d.proskurnin\projects\rdp_conn
 | `rdpconn/config.py` | значения протокола: единственный источник истины |
 | `rdpconn/crc.py` | CRC-16/CCITT-FALSE |
 | `rdpconn/framing.py` | сборка и разбор кадра, коды отказа, конструкторы кадров |
+| `rdpconn/segment.py` | команда длиннее `MAX_PAYLOAD` — кадры-кусочки `SEG1` (`docs/protocol.md` 4) |
 | `rdpconn/clipboard.py` | слот: маркер `RDP1`, история ячеек, занятость, пауза, горячая клавиша |
 | `rdpconn/app.py` | аргументы, обмен, `SeqCounter`, heartbeat, вывод |
-| `rdpconn/tx.py` / `rdpconn/rx.py` | два конца канала |
-| `rdpconn/__main__.py` | `python -m rdpconn tx|rx` |
-| `docs/protocol.md` | спецификация |
+| `rdpconn/tune.py` | замер паузы повтора снимка, рабочий запас (`PACE_MARGIN`) |
+| `rdpconn/tx.py` / `rdpconn/rx.py` | два конца канала команд |
+| `rdpconn/gate.py` | HTTP-прокси через буфер: `listen`/`dial`, магия `G1`, динамический потолок снимка |
+| `rdpconn/coder.py` | текст локальной модели через буфер: `host`/`guest`, магия `C1` |
+| `rdpconn/ends.py` | общий запуск `host`/`guest` с `--feed model\|net` поверх `coder`/`gate` |
+| `rdpconn/statcell.py` | служебная ячейка снимка гуеста для страницы статистики, магия `S1` |
+| `rdpconn/monitor.py` | веб-страница статуса слота, только читает |
+| `rdpconn/__main__.py` | `python -m rdpconn tx|rx|gate|coder|host|guest|monitor` |
+| `cline/rdpconnHandler.ts` | провайдер Cline: модель через `coder guest`, без http и порта |
+| `docs/protocol.md` | спецификация (`tx`/`rx`/`gate`; `coder`/`host`/`guest`/`monitor` — см. 1) |
 | `tools/test_*.py` | проверки без второй машины |
+| `tools/bench_*.py`, `tools/*_probe.py` | замеры и пробы на живом редиректе (потолок, алфавит, диск) |
 | `tools/make_portable.py` | архив для машины без интернета |
 
 ## 5. Проверки
 
-Скрипты без зависимостей, системный python, каждая завершается строкой
-`RESULT: ALL GREEN`:
+Скрипты без зависимостей, системный python, каждая завершается строкой с
+`ALL GREEN` (точный префикс гуляет: `RESULT: ALL GREEN`, `RESULT ALL GREEN`
+или просто `ALL GREEN` у части новых — ищите подстроку, не весь префикс):
 
 ```text
 cd C:\Users\d.proskurnin\projects\rdp_conn
@@ -95,7 +125,17 @@ python tools\test_frames.py       # кадр, CRC, разбор, коды NAK, �
 python tools\test_clipboard.py    # слот: маркер, история, пауза, занятость, restore
 python tools\test_heartbeat.py    # PING/PONG, молчание, возврат после обрыва
 python tools\test_duplex.py       # tx и rx двумя процессами через один слот
+python tools\test_gate.py         # прокси через буфер: listen/dial, G1
+python tools\test_coder.py        # текст модели через буфер: host/guest, C1
+python tools\test_statcell.py     # служебная ячейка статистики, S1
+python tools\test_monitor.py      # чтение слота без записи
+python tools\test_tune.py         # замер паузы повтора и рабочий запас
+python tools\test_ceiling.py      # потолок снимка без буфера: ступени, потеря
 ```
+
+Прогонять через PowerShell, как в этом разделе: `test_duplex.py` под
+git-bash/MINGW даёт ложный `FAIL` на проверке `cmd /c set` — в такой оболочке
+в окружении нет `SystemRoot`, это артефакт оболочки, а не канала.
 
 `--slot file:PATH` заменяет буфер обмена файлом — на этом держатся все четыре:
 хранилище отслоено (`WindowsClipboard` / `MemoryClipboard` / `FileClipboard`),
