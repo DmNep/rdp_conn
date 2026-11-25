@@ -58,7 +58,7 @@ import secrets
 import threading
 import time
 
-from . import config
+from . import config, statcell
 
 # Маркер нашего кадра и версия формата в одном токене. Текст слота без него —
 # чужая копия. Кадр старого формата (XCONN1) здесь не разберётся и будет принят
@@ -82,16 +82,19 @@ DEFAULT_HOTKEY = "ctrl+alt+f9"
 # Опрос буфера. 50 мс — компромисс: ниже порога ощущаемой задержки обмена
 # (кадр всё равно собирается дольше), но неBusyWait, греющий CPU.
 POLL_S = 0.05
-# Редирект сначала двигает номер буфера, а текст подставляет следом.
-# Пока номер тот же, буфер не открываем. После нового номера, если строка
-# ещё старая, сверяем её раз в секунду всё время ожидания и номер не
-# закрываем.
+# Номер буфера приходит раньше текста. Пока номер молчит, буфер не открываем.
+# После нового номера строка читается сразу, затем несколько раз часто:
+# текст часто догоняет номер за десятые доли секунды. Если и тогда строка
+# старая, сверка возвращается к разу в секунду, чтобы не держать OpenClipboard.
 STALE_RECHECK_S = 1.0
-# Один повтор той же полезной нагрузки новой ячейкой, если за это время
+STALE_FAST_S = 0.05
+STALE_FAST_TRIES = 8
+# Повтор той же полезной нагрузки новой ячейкой, если за это время
 # ответ не пришёл. Сам по себе повтор снимок не лечит: пока идёт серия
 # записей, ответ в слот не садится. Живой путь его не заказывает.
-# Стартовое значение. После замера rdpconn.tune ставит предел × PACE_MARGIN.
-NUDGE_AFTER_S = 1.0
+# На стенде повтор ещё доходил при 0.7 с и начинал стирать ответ при 0.6 с.
+# В работе предел × PACE_MARGIN: 0.7 × 1.33 = 0.94 с.
+NUDGE_AFTER_S = 0.94
 # Столько байт одной записи редирект увозит: первая часто остаётся на хосте,
 # повтор тех же байт новой ячейкой через секунду доходит. Крупнее этого
 # первая запись на хосте и остаётся, и тот же повтор её не вытаскивает.
@@ -205,6 +208,30 @@ class WindowsClipboard:
         finally:
             self._user32.CloseClipboard()
 
+    def try_read(self):
+        """Одно открытие, без повторов.
+
+        Наблюдатель так не держит слот, пока его пишет обмен: занятый буфер
+        просто ошибка, и следующая проверка номера попробует ещё раз.
+        """
+        if not self._user32.IsClipboardFormatAvailable(self.CF_UNICODETEXT):
+            return None
+        if not self._user32.OpenClipboard(None):
+            raise ClipboardError("буфер занят другим приложением")
+        try:
+            handle = self._user32.GetClipboardData(self.CF_UNICODETEXT)
+            if not handle:
+                return None
+            pointer = self._kernel32.GlobalLock(handle)
+            if not pointer:
+                raise ClipboardError("GlobalLock не удалось")
+            try:
+                return ctypes.wstring_at(pointer)
+            finally:
+                self._kernel32.GlobalUnlock(handle)
+        finally:
+            self._user32.CloseClipboard()
+
     def write(self, text: str) -> None:
         data = text.encode("utf-16-le") + b"\x00\x00"
         handle = self._kernel32.GlobalAlloc(self.GMEM_MOVEABLE, len(data))
@@ -252,6 +279,9 @@ class MemoryClipboard:
         with MemoryClipboard._lock:
             return MemoryClipboard._text
 
+    def try_read(self):
+        return self.read()
+
     def write(self, text: str) -> None:
         with MemoryClipboard._lock:
             MemoryClipboard._text = text
@@ -293,6 +323,9 @@ class FileClipboard:
                 return handle.read() or None
         except OSError:
             return None
+
+    def try_read(self):
+        return self.read()
 
     def write(self, text: str) -> None:
         tmp = self._path + ".tmp"
@@ -636,6 +669,7 @@ class ClipboardTransport:
         # Номер, который уже виден, но текст по нему ещё не прочитан.
         self._pending_seq = None
         self._read_at = 0.0
+        self._stale_tries = 0
         # Ячейки, которые уже лежали в слоте, — не наш пропущенный кадр:
         # процесс только что стартовал. Иначе старый ACK с seq=0 принимается
         # за ответ на команду, которую этот процесс ещё только пошлёт.
@@ -690,6 +724,13 @@ class ClipboardTransport:
         # можно и нужно, иначе любая случайная копия глушила бы канал.
         self.busy = False
         self._busy_at = None
+        # Гуест подставляет сюда сборку одной служебной ячейки. Хост — сводку.
+        # Пусто — снимок как раньше, без лишней ячейки.
+        self.stats_frame = None
+        self.on_stats = None
+        self.picture = None
+        self.board = None
+        self._meter_out = 0
         self.auto_pause = auto_pause
         self._hotkey = None
         if hotkey:
@@ -914,7 +955,7 @@ class ClipboardTransport:
         self._nudge_once = False
         self._publish_many([self._last_out], keep_history=True, schedule_nudge=nudge)
 
-    def send_many(self, frames) -> None:
+    def send_many(self, frames, limit: int | None = None) -> None:
         """Весь ответ одной записью буфера.
 
         ACK и каждый NOTE отдельным SetClipboardData оставляют редиректу
@@ -931,7 +972,7 @@ class ClipboardTransport:
         # читает NOTE предыдущей и принимает его за свой ответ.
         nudge = self._nudge_once
         self._nudge_once = False
-        self._publish_many(blob, keep_history=False, schedule_nudge=nudge)
+        self._publish_many(blob, keep_history=False, schedule_nudge=nudge, limit=limit)
 
     def peek_pending(self):
         """Кадр, уже разобранный из слота, но ещё не отданный наружу."""
@@ -952,7 +993,7 @@ class ClipboardTransport:
                 self.consider_slot()
 
             if self._pending:
-                return self._pending.pop(0)
+                return self._deliver(self._pending.pop(0))
 
             # Новая копия уже сменила номер слота. Повтор своей записи
             # в этот же заход стёр бы её раньше, чем мы успели её прочитать.
@@ -972,6 +1013,7 @@ class ClipboardTransport:
             if seq != self._seen_seq:
                 if self._pending_seq != seq:
                     self._pending_seq = seq
+                    self._stale_tries = 0
                     # Первое чтение сразу: на слоте в памяти текст уже новый,
                     # и короткие таймауты тестов на это рассчитаны.
                     self._read_at = now
@@ -993,13 +1035,15 @@ class ClipboardTransport:
                 # Пока строка прежняя, номер открыт. Следующий receive()
                 # продолжит ждать: ожидание длиннее одного вызова.
                 if text == self._last_text:
-                    self._read_at = now + STALE_RECHECK_S
+                    self._stale_tries += 1
+                    gap = STALE_FAST_S if self._stale_tries <= STALE_FAST_TRIES else STALE_RECHECK_S
+                    self._read_at = now + gap
                 else:
                     self._seen_seq = seq
                     self._pending_seq = None
                     got = self._ingest(text)
                     if got is not None:
-                        return got
+                        return self._deliver(got)
                 if now >= deadline:
                     return None
                 pause = min(POLL_S, deadline - now)
@@ -1044,6 +1088,9 @@ class ClipboardTransport:
         if not frames:
             return
         self._publish_many(frames, keep_history=False, schedule_nudge=False)
+        hook = getattr(self, "on_nudge", None)
+        if hook is not None:
+            hook()
 
     def close(self) -> None:
         if self._paste_watch is not None:
@@ -1078,7 +1125,7 @@ class ClipboardTransport:
         self._nudge_at = time.monotonic() + NUDGE_AFTER_S
 
     def _publish_many(self, frames, keep_history: bool = True,
-                      schedule_nudge: bool = True) -> None:
+                      schedule_nudge: bool = True, limit: int | None = None) -> None:
         """Записать свои ячейки одной операцией, сохранив чужие.
 
         Слот один, а направлений два, поэтому текст слота — это набор
@@ -1103,18 +1150,34 @@ class ClipboardTransport:
         pin = self._pin_signal
         if pin and pin not in frames:
             frames = list(frames) + [pin]
+        # Повтор снимка приносит прошлую служебную ячейку вместе с данными.
+        # Снимаем её и кладём одну свежую, иначе в слоте окажутся две.
+        frames = [raw for raw in frames if not statcell.is_frame(raw)]
+        stat = self._stats_cell()
+        if not frames and stat is None:
+            return
         fresh = []
         for raw in frames:
             self._out_seq += 1
             fresh.append((self._out_seq, base64.b64encode(raw).decode("ascii")))
         # Своя очередь newest-first. В слот входит вся пачка, а не только
         # последняя ячейка: иначе редирект увозил бы хвост без ACK.
+        # Служебная ячейка добавляется сверху и данные не вытесняет:
+        # окно кодера иначе потеряло бы последний кусок.
         mine = list(reversed(fresh))
-        if len(mine) > HISTORY_SLOTS:
-            mine = mine[:HISTORY_SLOTS]
+        cap = limit if limit else HISTORY_SLOTS
+        if len(mine) > cap:
+            mine = mine[:cap]
         elif keep_history:
-            mine.extend(self._my_history[:HISTORY_SLOTS - len(mine)])
+            older = [pair for pair in self._my_history if not self._cell_is_stats(pair)]
+            room = HISTORY_SLOTS - len(mine)
+            if room > 0:
+                mine.extend(older[:room])
+        if stat is not None:
+            self._out_seq += 1
+            mine.insert(0, (self._out_seq, base64.b64encode(stat).decode("ascii")))
         self._my_history = mine
+        self._meter_out = sum(len(raw) for raw in frames)
         head = mine[0]
         merged = self._merge(mine, {})
         landed = False
@@ -1153,6 +1216,7 @@ class ClipboardTransport:
             if self._store.seq() != mark:
                 continue
             if self._write_held() or self._refuse_human(text_in):
+                self._meter_out = 0
                 return
             self._store.write(merged)
             self._note_local_write(merged)
@@ -1178,6 +1242,36 @@ class ClipboardTransport:
         self._seen_seq = self._store.seq()
         self._last_text = merged
         self._pending_seq = None
+        n = self._meter_out
+        self._meter_out = 0
+        picture = self.picture
+        if picture is not None and n:
+            picture.add_into(n)
+
+    def _deliver(self, frame: bytes):
+        picture = self.picture
+        if picture is not None and frame:
+            picture.add_from(len(frame))
+        return frame
+
+    def _stats_cell(self):
+        cb = self.stats_frame
+        if cb is None:
+            return None
+        try:
+            raw = cb()
+        except Exception:
+            return None
+        if not raw or not statcell.is_frame(raw):
+            return None
+        return raw
+
+    def _cell_is_stats(self, pair) -> bool:
+        try:
+            raw = base64.b64decode(pair[1], validate=True)
+        except (binascii.Error, ValueError, IndexError):
+            return False
+        return statcell.is_frame(raw)
 
     def _ingest(self, text):
         """Разобрать текст, если он отличается от уже увиденного.
@@ -1296,6 +1390,15 @@ class ClipboardTransport:
                 except (binascii.Error, ValueError):
                     continue
                 self._seen_frames.setdefault(who, []).append((num, b64))
+                if statcell.is_frame(data):
+                    info = statcell.unpack(data)
+                    if info is not None:
+                        if self.picture is not None:
+                            self.picture.note_guest(info)
+                        hook = self.on_stats
+                        if hook is not None:
+                            hook(info)
+                    continue
                 if self._pin_ready and self._pin_signal is not None:
                     known = self._pin_seen.get(who, ())
                     if (num, b64) not in known:

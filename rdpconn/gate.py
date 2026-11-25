@@ -33,6 +33,9 @@ OP_POLL = 7
 # переиздаёт снимок через секунду и слот снова занят.
 OP_HALT = 8
 OP_GO = 9
+# Короткий ход: в снимке только подтверждения. Занятая сторона пишет следом ещё раз.
+# Больше одного пропуска подряд не бывает, иначе обратный запрос застревает.
+OP_YIELD = 10
 _HEAD = 9  # magic + op + id + offset
 DATA_MAX = config.MAX_PAYLOAD - _HEAD
 MAX_STREAMS = 2
@@ -40,6 +43,21 @@ MAX_STREAMS = 2
 # соединений не успевает ни одно, слоты остаются заняты, и проверка
 # «Кода онлайн» больше не стартует.
 _STALL_S = 20.0
+# Оба направления уже сходили: это живой туннель, а не оборванное рукопожатие.
+# Его можно держать тихим, чтобы следующий запрос Коды не начинал TLS заново.
+_WARM_S = 180.0
+# Мелкие куски TCP подождать и увезти одним снимком. Полный снимок не ждёт.
+_COALESCE_S = 0.15
+# Ячеек в одном снимке шлюза. 20 ячеек протокола команд сюда не входят:
+# у шлюза свой потолок, пока текст слота ниже размера, который редирект увозит.
+# Пишем с 40 ячеек. Читаем сразу до 58, иначе чужая ступень выглядит как потеря.
+# 40 ячеек — около 14 тысяч символов. 58 — около 20 тысяч, ниже записи в 16 КБ.
+GATE_CELLS_MIN = 40
+GATE_CELLS_STEP = 6
+GATE_CELLS_MAX = 58
+GATE_CELLS = GATE_CELLS_MAX
+GATE_TEXT_MIN = 14000
+GATE_TEXT_MAX = GATE_TEXT_MIN * GATE_CELLS_MAX // GATE_CELLS_MIN
 _WINDOW = 64 * 1024
 _CONNECT_WAIT = 4.0
 # Неблокирующий connect: эти коды значат «ещё идёт», а не ошибку.
@@ -75,6 +93,8 @@ class Pipe:
         self.saw_peer = False
         self.offered = 0
         self.touch = time.monotonic()
+        self.read_n = 0
+        self.wrote_n = 0
 
 
 def pack(op: int, sid: int, body: bytes = b"", offset: int = 0) -> bytes:
@@ -157,25 +177,296 @@ def _frame(seq: app.SeqCounter, op: int, sid: int, body: bytes = b"", offset: in
     return framing.build_frame(config.NOTE, seq.take(), pack(op, sid, body, offset))
 
 
-def build_frames(pipes: dict[int, Pipe], seq: app.SeqCounter, drive: bool, reserve: int = 0) -> list[bytes]:
+def _cell_chars(raw: bytes) -> int:
+    """Сколько символов ячейка займёт в тексте слота, с запасом на номер."""
+    return 12 + 4 * ((len(raw) + 2) // 3)
+
+
+_BIAS_WINDOW_S = 3.0
+# Чужое направление должно быть заметно толще, иначе каждый круг будет прыгать.
+_BIAS_MIN_B = 1024
+
+
+class Bias:
+    """Кому отдать следующий полный снимок.
+
+    Очередь прямо сейчас важнее среднего. Среднее за 3 с только не даёт
+    переключаться, пока перевес не подержался. Рукопожатие сюда не входит.
+    """
+
+    def __init__(self) -> None:
+        self.peer_data = 0
+        self.yielded = False
+        self.told = False
+        self.sent = 0
+        self.recv = 0
+        self._gave = False
+        self._took = False
+        self._samples: list[tuple[float, int, int]] = []
+
+    def note_peer(self, frames) -> None:
+        data_n = _data_bytes(frames)
+        self.recv += data_n
+        if data_n:
+            self.peer_data += 1
+        if self._gave:
+            self._credit("gave", data_n)
+            self._gave = False
+        if _has_yield(frames):
+            self._took = True
+        self._mark()
+
+    def note_sent(self, frames, yielded: bool) -> None:
+        data_n = _data_bytes(frames)
+        self.sent += data_n
+        if self._took and not yielded:
+            self._credit("took", data_n)
+            self._took = False
+        if yielded:
+            self.yielded = True
+            self._gave = True
+        else:
+            self.yielded = False
+            self.peer_data = 0
+        self._mark()
+        if yielded and not self.told:
+            app.say(".. чужое направление больше, короткий ход")
+            self.told = True
+        if not yielded and self.told and not self.peer_heavier():
+            app.say(".. ход снова поровну")
+            self.told = False
+
+    def _credit(self, kind: str, n: int) -> None:
+        face = monitor.current()
+        if face is not None:
+            face.turn(kind, n)
+
+    def should_yield(self, pipes: dict[int, Pipe]) -> bool:
+        if self.yielded or self.peer_data < 1:
+            return False
+        if _bias_blocked(pipes) or _backlog(pipes) > 0:
+            return False
+        return self.peer_heavier()
+
+    def peer_heavier(self) -> bool:
+        if not self._samples:
+            return False
+        start = self._samples[0]
+        span = time.monotonic() - start[0]
+        if span < 2.0:
+            return False
+        sent = self.sent - start[1]
+        recv = self.recv - start[2]
+        return recv >= sent + _BIAS_MIN_B and recv > sent * 2
+
+    def _mark(self) -> None:
+        now = time.monotonic()
+        self._samples.append((now, self.sent, self.recv))
+        cutoff = now - _BIAS_WINDOW_S
+        keep = 0
+        for index, sample in enumerate(self._samples):
+            if sample[0] >= cutoff:
+                keep = max(0, index - 1)
+                break
+        if keep:
+            del self._samples[:keep]
+
+
+def _is_yield(raw: bytes) -> bool:
+    try:
+        item = unpack(framing.parse_frame(raw).payload)
+    except framing.FrameError:
+        return False
+    return item is not None and item[0] == OP_YIELD
+
+
+def _note_payload(frame):
+    if isinstance(frame, (bytes, bytearray)):
+        try:
+            frame = framing.parse_frame(frame)
+        except framing.FrameError:
+            return None
+    if getattr(frame, "type", None) != config.NOTE:
+        return None
+    return frame.payload
+
+
+def _has_yield(frames) -> bool:
+    for frame in frames:
+        payload = _note_payload(frame)
+        if payload is None:
+            continue
+        item = unpack(payload)
+        if item is not None and item[0] == OP_YIELD:
+            return True
+    return False
+
+
+def _data_bytes(frames) -> int:
+    total = 0
+    for frame in frames:
+        payload = _note_payload(frame)
+        if payload is None:
+            continue
+        item = unpack(payload)
+        if item is None:
+            continue
+        op, _sid, _offset, body = item
+        if op == OP_DATA and body:
+            total += len(body)
+    return total
+
+
+def _backlog(pipes: dict[int, Pipe]) -> int:
+    return sum(max(0, pipe.base + len(pipe.to_peer) - pipe.offered) for pipe in pipes.values())
+
+
+def _bias_blocked(pipes: dict[int, Pipe]) -> bool:
+    """Рукопожатие и ещё не открытый поток ход не отдают."""
+    for pipe in pipes.values():
+        if pipe.failed or (pipe.local_eof and pipe.remote_eof):
+            continue
+        if pipe.connecting or (pipe.sock is not None and not pipe.opened):
+            return True
+        if pipe.mode and not pipe.opened:
+            return True
+        if pipe.opened and pipe.sock is not None and (pipe.read_n == 0 or pipe.wrote_n == 0):
+            return True
+    return False
+
+
+def text_limit(cells: int) -> int:
+    """Символы слота растут вместе с ячейками, иначе новая ступень пустая."""
+    return GATE_TEXT_MIN * cells // GATE_CELLS_MIN
+
+
+class Ceiling:
+    """Сколько ячеек класть в свой снимок.
+
+    Вверх — только полный снимок, который подтвердили. Обычный повтор
+    через 0.94 с потерей не считается. Одна потеря минус 6, вторая подряд
+    без чистого полного снимка — сразу на 40 и до следующей паузы.
+    """
+
+    def __init__(self) -> None:
+        self.cells = GATE_CELLS_MIN
+        self.allow = True
+        self.strikes = 0
+        self.armed = False
+        self.nudge_seen = False
+        self.need: dict[int, int] = {}
+        self.quiet_since: float | None = None
+
+    @property
+    def text_max(self) -> int:
+        return text_limit(self.cells)
+
+    def arm(self, pipes: dict[int, Pipe], transport) -> None:
+        self.observe(pipes)
+        self.need = {
+            pipe.sid: pipe.offered
+            for pipe in pipes.values()
+            if pipe.offered > pipe.base
+        }
+        self.armed = bool(self.need)
+        self.nudge_seen = False
+        if self.armed:
+            transport.on_nudge = self._mark_nudge
+
+    def clear(self) -> None:
+        self.armed = False
+        self.need = {}
+        self.nudge_seen = False
+
+    def observe(self, pipes: dict[int, Pipe]) -> None:
+        self._rearm_idle(pipes)
+        if not self.armed:
+            return
+        if self._confirmed(pipes):
+            self._raise()
+            return
+        if self.nudge_seen:
+            self._drop()
+
+    def _mark_nudge(self) -> None:
+        self.nudge_seen = True
+
+    def _confirmed(self, pipes: dict[int, Pipe]) -> bool:
+        for sid, offset in self.need.items():
+            pipe = pipes.get(sid)
+            if pipe is not None and pipe.base < offset:
+                return False
+        return True
+
+    def _raise(self) -> None:
+        old = self.cells
+        self.strikes = 0
+        self.clear()
+        if not self.allow or old >= GATE_CELLS_MAX:
+            return
+        self.cells = min(GATE_CELLS_MAX, old + GATE_CELLS_STEP)
+        app.say(f".. потолок {old} → {self.cells}, полный снимок подтверждён")
+
+    def _drop(self) -> None:
+        old = self.cells
+        self.clear()
+        if self.strikes >= 1:
+            self.cells = GATE_CELLS_MIN
+            self.allow = False
+            self.quiet_since = None
+            self.strikes = 0
+            app.say(f".. потолок {old} → {self.cells}, вторая потеря, жду новую передачу")
+            return
+        self.strikes = 1
+        self.cells = max(GATE_CELLS_MIN, old - GATE_CELLS_STEP)
+        if self.cells == GATE_CELLS_MIN:
+            self.allow = False
+            self.quiet_since = None
+        app.say(f".. потолок {old} → {self.cells}, повтор не доехал")
+
+    def _rearm_idle(self, pipes: dict[int, Pipe]) -> None:
+        if self.allow:
+            return
+        busy = self.armed or _backlog(pipes) > 0
+        now = time.monotonic()
+        if busy:
+            self.quiet_since = None
+            return
+        if self.quiet_since is None:
+            self.quiet_since = now
+        elif now - self.quiet_since >= 2.0:
+            self.allow = True
+            self.quiet_since = None
+            app.say(".. потолок снова можно поднимать")
+
+
+def build_frames(pipes: dict[int, Pipe], seq: app.SeqCounter, drive: bool, reserve: int = 0,
+                 yield_turn: bool = False, cells: int | None = None,
+                 text_max: int | None = None) -> list[bytes]:
     """Снимок: сначала байты живого запроса, в хвосте подтверждения.
 
     reserve — ячейки под OK/FAIL, иначе повтор старого хвоста вытесняет
     ответ «соединение открыто» и новый запрос Коды молчит до обрыва.
+    Потолок записи — текущая ступень, не HISTORY_SLOTS команд.
     """
+    cells = GATE_CELLS_MIN if cells is None else cells
+    text_max = text_limit(cells) if text_max is None else text_max
     frames: list[bytes] = []
     ack_n = sum(1 for pipe in pipes.values() if pipe.local_got > 0)
-    held = min(ack_n, config.HISTORY_SLOTS - 1) + max(0, reserve)
-    if held >= config.HISTORY_SLOTS:
-        held = config.HISTORY_SLOTS - 1
-    room = config.HISTORY_SLOTS - held
+    held = min(ack_n, cells - 1) + max(0, reserve)
+    if held >= cells:
+        held = cells - 1
+    room = cells - held
+    used = 0
 
     def add(raw: bytes) -> bool:
-        nonlocal room
-        if room <= 0:
+        nonlocal room, used
+        cost = _cell_chars(raw)
+        if room <= 0 or used + cost > text_max:
             return False
         frames.append(raw)
         room -= 1
+        used += cost
         return True
 
     for pipe in pipes.values():
@@ -185,27 +476,30 @@ def build_frames(pipes: dict[int, Pipe], seq: app.SeqCounter, drive: bool, reser
             if not add(_frame(seq, OP_OPEN, pipe.sid, body)):
                 break
     ordered = sorted(pipes.values(), key=lambda pipe: (pipe.sock is None, pipe.sid))
-    for pipe in ordered:
-        view = memoryview(pipe.to_peer)
-        pos = 0
-        if room > 0:
-            while pos < len(view) and room > 0:
-                chunk = bytes(view[pos:pos + DATA_MAX])
-                add(_frame(seq, OP_DATA, pipe.sid, chunk, pipe.base + pos))
-                pos += len(chunk)
-            pipe.offered = pipe.base + pos
-        if room <= 0:
-            break
+    if not yield_turn:
+        for pipe in ordered:
+            view = memoryview(pipe.to_peer)
+            pos = 0
+            if room > 0:
+                while pos < len(view) and room > 0:
+                    chunk = bytes(view[pos:pos + DATA_MAX])
+                    add(_frame(seq, OP_DATA, pipe.sid, chunk, pipe.base + pos))
+                    pos += len(chunk)
+                pipe.offered = pipe.base + pos
+            if room <= 0:
+                break
     for pipe in pipes.values():
         if pipe.local_eof and not pipe.to_peer and not pipe.end_sent:
             if add(_frame(seq, OP_END, pipe.sid)):
                 pipe.end_sent = True
-    room = config.HISTORY_SLOTS - len(frames)
+    room = cells - len(frames)
     for pipe in pipes.values():
         if pipe.local_got <= 0:
             continue
         if not add(_frame(seq, OP_ACK, pipe.sid, offset=pipe.local_got)):
             break
+    if yield_turn:
+        add(_frame(seq, OP_YIELD, 0))
     if drive and not frames:
         add(_frame(seq, OP_POLL, 0))
     return frames
@@ -281,7 +575,7 @@ def apply_frames(pipes: dict[int, Pipe], frames, dial: bool, transport=None) -> 
             if transport is not None:
                 transport.resume(announce=False)
             continue
-        if op == OP_POLL:
+        if op == OP_POLL or op == OP_YIELD:
             continue
         pipe = pipes.get(sid)
         if op == OP_OPEN and dial:
@@ -341,6 +635,7 @@ def _pull(pipe: Pipe) -> None:
         pipe.local_eof = True
         return
     pipe.touch = time.monotonic()
+    pipe.read_n += len(chunk)
     pipe.to_peer.extend(chunk)
     _meter_in(pipe.sid, len(chunk))
 
@@ -362,6 +657,7 @@ def _flush(pipe: Pipe) -> None:
         return
     if sent:
         pipe.touch = time.monotonic()
+        pipe.wrote_n += sent
         _meter_out(pipe.sid, sent)
     del pipe.to_sock[:sent]
 
@@ -457,10 +753,15 @@ def _reap(pipes: dict[int, Pipe]) -> None:
     for pipe in list(pipes.values()):
         if pipe.sock is None:
             continue
-        if now - pipe.touch <= _STALL_S:
+        warm = pipe.opened and pipe.read_n > 0 and pipe.wrote_n > 0
+        if now - pipe.touch <= (_WARM_S if warm else _STALL_S):
             continue
-        app.warn(f".. поток {pipe.sid} молчит, закрываю")
-        _meter_close(pipe.sid, "молчит, закрыт")
+        if warm:
+            app.warn(f".. поток {pipe.sid} тихий, закрываю")
+            _meter_close(pipe.sid, "тихий, закрыт")
+        else:
+            app.warn(f".. поток {pipe.sid} молчит, закрываю")
+            _meter_close(pipe.sid, "молчит, закрыт")
         _abandon(pipe)
 
 
@@ -484,26 +785,79 @@ def pump(pipes: dict[int, Pipe], dial: bool) -> None:
     _close_done(pipes)
 
 
-def gather(pipes: dict[int, Pipe], pause: float) -> None:
-    """Забрать то, что сокет уже готов отдать, не держа снимок лишнюю секунду."""
+def _pending_bytes(pipes: dict[int, Pipe]) -> int:
+    return sum(max(0, pipe.base + len(pipe.to_peer) - pipe.offered) for pipe in pipes.values())
+
+
+def _snapshot_full(pipes: dict[int, Pipe], cells: int = GATE_CELLS_MIN) -> bool:
+    return _pending_bytes(pipes) >= (cells - 2) * DATA_MAX
+
+
+def _hold_small(pipes: dict[int, Pipe], dial: bool, cells: int = GATE_CELLS_MIN) -> None:
+    """Подождать мелкие куски, если снимок ещё не полный."""
+    if not _has_tail(pipes) or _snapshot_full(pipes, cells):
+        return
+    end = time.monotonic() + _COALESCE_S
+    while time.monotonic() < end and not _snapshot_full(pipes, cells):
+        pump(pipes, dial=dial)
+        time.sleep(0.02)
+
+
+def gather(pipes: dict[int, Pipe], pause: float, cells: int = GATE_CELLS_MIN) -> None:
+    """Забрать байты сокета. Первый кусок подождать ещё 150 мс, полный снимок — нет."""
     end = time.monotonic() + pause
+    first = None
     while time.monotonic() < end:
-        before = sum(len(p.to_peer) for p in pipes.values())
         pump(pipes, dial=True)
-        if sum(len(p.to_peer) for p in pipes.values()) > before:
-            time.sleep(0.02)
-            pump(pipes, dial=True)
+        if _snapshot_full(pipes, cells):
             return
+        if _pending_bytes(pipes) > 0:
+            if first is None:
+                first = time.monotonic()
+            if time.monotonic() - first >= _COALESCE_S:
+                pump(pipes, dial=True)
+                return
         time.sleep(0.01)
 
 
-def send_snapshot(transport, frames: list[bytes]) -> str | None:
+def _remember_gate(transport, frames, pipes: dict[int, Pipe]) -> None:
+    """Цифры гуеста перед снимком. На хосте доски нет, вызов пустой."""
+    board = getattr(transport, "board", None)
+    if board is None:
+        return
+    live = 0
+    for pipe in pipes.values():
+        if pipe.sock is None or pipe.failed:
+            continue
+        if pipe.local_eof and pipe.remote_eof:
+            continue
+        live += 1
+    board.note(len(frames), _backlog(pipes), live)
+
+
+def _stat_fail(transport) -> None:
+    board = getattr(transport, "board", None)
+    if board is None:
+        return
+    from .statcell import ERR_SEND
+    board.fail(ERR_SEND)
+
+
+def send_snapshot(transport, frames: list[bytes], limit: int | None = None) -> str | None:
     face = monitor.current()
     if face is not None and frames:
         face.channel(out_n=sum(len(raw) for raw in frames))
     if hasattr(transport, "_nudge_once"):
         transport._nudge_once = True
-    return app.send_frames(transport, frames)
+    many = getattr(transport, "send_many", None)
+    if many is None:
+        return app.send_frames(transport, frames)
+    from .clipboard import ClipboardError
+    try:
+        many(frames, limit=limit or GATE_CELLS_MIN)
+    except ClipboardError as exc:
+        return str(exc)
+    return None
 
 
 def recv_snapshot(transport, first_wait: float, idle: float = 0.05):
@@ -513,7 +867,7 @@ def recv_snapshot(transport, first_wait: float, idle: float = 0.05):
     if frame is None:
         return []
     got = [frame]
-    while len(got) < config.HISTORY_SLOTS:
+    while len(got) < GATE_CELLS_MAX:
         frame, err = app.receive_frame(transport, idle)
         if frame is None:
             break
@@ -608,23 +962,36 @@ def _has_tail(pipes: dict[int, Pipe]) -> bool:
     return any(p.base + len(p.to_peer) > p.offered for p in pipes.values())
 
 
-def _emit(transport, pipes: dict[int, Pipe], seq: app.SeqCounter, poll: bool) -> None:
+def _emit(transport, pipes: dict[int, Pipe], seq: app.SeqCounter, poll: bool,
+          bias: Bias | None = None, ceiling: Ceiling | None = None) -> None:
+    if ceiling is not None:
+        ceiling.observe(pipes)
+    yield_turn = bool(bias is not None and bias.should_yield(pipes))
+    cells = ceiling.cells if ceiling is not None else GATE_CELLS_MIN
     status = _dial_status(pipes, seq)
-    out = build_frames(pipes, seq, drive=False, reserve=len(status))
-    room = config.HISTORY_SLOTS - len(out)
-    for raw in status:
-        if room <= 0:
-            break
-        out.append(raw)
-        room -= 1
+    out = build_frames(pipes, seq, drive=False, reserve=len(status), yield_turn=yield_turn,
+                       cells=cells)
+    if not yield_turn:
+        room = cells - len(out)
+        for raw in status:
+            if room <= 0:
+                break
+            out.append(raw)
+            room -= 1
     if not out:
         if not poll:
             return
         out = [_frame(seq, OP_POLL, 0)]
-    fail = send_snapshot(transport, out)
+    if bias is not None:
+        bias.note_sent(out, yield_turn and any(_is_yield(raw) for raw in out))
+    _remember_gate(transport, out, pipes)
+    fail = send_snapshot(transport, out, limit=cells)
+    if ceiling is not None and not yield_turn and _backlog(pipes) > 0:
+        ceiling.arm(pipes, transport)
     if transport.yielding:
         return
     if fail is not None:
+        _stat_fail(transport)
         app.warn(f"?? ответ шлюза не ушёл: {fail}")
 
 
@@ -633,6 +1000,8 @@ def dial_loop(transport, stop, wait: float, face: monitor.Face | None = None) ->
     _arm_pause(transport)
     pipes: dict[int, Pipe] = {}
     seq = app.SeqCounter()
+    bias = Bias()
+    ceiling = Ceiling()
     while not stop.is_set():
         _meter_hold(transport)
         _reap(pipes)
@@ -642,17 +1011,22 @@ def dial_loop(transport, stop, wait: float, face: monitor.Face | None = None) ->
                 pipe.touch = now
             frames = recv_snapshot(transport, 0.2)
             if frames:
+                bias.note_peer(frames)
                 apply_frames(pipes, frames, dial=True, transport=transport)
+                ceiling.observe(pipes)
             continue
         pause = 0.15 if _has_tail(pipes) else (0.3 if stop.is_set() else wait)
         frames = recv_snapshot(transport, pause)
         if not frames:
             _finish_connect(pipes)
+            ceiling.observe(pipes)
             if _has_tail(pipes) and not transport.paused:
-                gather(pipes, 0.05)
-                _emit(transport, pipes, seq, poll=False)
+                gather(pipes, 0.05, ceiling.cells)
+                _emit(transport, pipes, seq, poll=False, bias=bias, ceiling=ceiling)
             continue
+        bias.note_peer(frames)
         apply_frames(pipes, frames, dial=True, transport=transport)
+        ceiling.observe(pipes)
         if transport.paused:
             continue
         _finish_connect(pipes)
@@ -660,9 +1034,9 @@ def dial_loop(transport, stop, wait: float, face: monitor.Face | None = None) ->
         while time.monotonic() < end and any(p.connecting for p in pipes.values()):
             time.sleep(0.02)
             _finish_connect(pipes)
-        gather(pipes, 0.3)
+        gather(pipes, 0.3, ceiling.cells)
         _finish_connect(pipes)
-        _emit(transport, pipes, seq, poll=True)
+        _emit(transport, pipes, seq, poll=True, bias=bias, ceiling=ceiling)
 
 
 def _read_head(conn: socket.socket) -> tuple[bytes, bytes] | None:
@@ -828,6 +1202,8 @@ def _accept(srv: socket.socket, pipes: dict[int, Pipe], nxt: int) -> int:
 
 def listen_loop(transport, proxy_host: str, proxy_port: int, stop, wait: float,
                  face: monitor.Face | None = None) -> None:
+    from .statcell import FEED_NET, attach_guest
+    attach_guest(transport, FEED_NET)
     monitor.bind(face)
     _arm_pause(transport)
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -838,6 +1214,8 @@ def listen_loop(transport, proxy_host: str, proxy_port: int, stop, wait: float,
     app.say(f"прокси http://{proxy_host}:{proxy_port}")
     pipes: dict[int, Pipe] = {}
     seq = app.SeqCounter(1)
+    bias = Bias()
+    ceiling = Ceiling()
     nxt = 1
     try:
         while not stop.is_set():
@@ -850,20 +1228,34 @@ def listen_loop(transport, proxy_host: str, proxy_port: int, stop, wait: float,
                     pipe.touch = now
                 reply = recv_snapshot(transport, 0.2)
                 if reply:
+                    bias.note_peer(reply)
                     apply_frames(pipes, reply, dial=False, transport=transport)
+                    ceiling.observe(pipes)
                 continue
-            frames = build_frames(pipes, seq, drive=waiting)
+            ceiling.observe(pipes)
+            yield_turn = bias.should_yield(pipes)
+            if not yield_turn:
+                _hold_small(pipes, dial=False, cells=ceiling.cells)
+            frames = build_frames(pipes, seq, drive=waiting, yield_turn=yield_turn,
+                                  cells=ceiling.cells)
             if not frames:
                 reply = recv_snapshot(transport, 0.05)
                 if reply:
+                    bias.note_peer(reply)
                     apply_frames(pipes, reply, dial=False, transport=transport)
+                    ceiling.observe(pipes)
                 else:
                     time.sleep(0.05)
                 continue
-            fail = send_snapshot(transport, frames)
+            bias.note_sent(frames, yield_turn and any(_is_yield(raw) for raw in frames))
+            _remember_gate(transport, frames, pipes)
+            fail = send_snapshot(transport, frames, limit=ceiling.cells)
+            if not yield_turn and _backlog(pipes) > 0:
+                ceiling.arm(pipes, transport)
             if transport.yielding:
                 continue
             if fail is not None:
+                _stat_fail(transport)
                 if not transport.paused:
                     app.warn(f"?? снимок шлюза не ушёл: {fail}")
                     time.sleep(0.2)
@@ -875,8 +1267,11 @@ def listen_loop(transport, proxy_host: str, proxy_port: int, stop, wait: float,
                 for pipe in pipes.values():
                     pipe.end_sent = False
                 app.warn(".. тишина шлюза, повторю снимок")
+                ceiling.observe(pipes)
                 continue
+            bias.note_peer(reply)
             apply_frames(pipes, reply, dial=False, transport=transport)
+            ceiling.observe(pipes)
             for pipe in pipes.values():
                 if pipe.failed:
                     _reject(pipe)
