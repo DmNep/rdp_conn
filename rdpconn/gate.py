@@ -46,6 +46,14 @@ _STALL_S = 20.0
 # Оба направления уже сходили: это живой туннель, а не оборванное рукопожатие.
 # Его можно держать тихим, чтобы следующий запрос Коды не начинал TLS заново.
 _WARM_S = 180.0
+# Повтор снимка на тишине (listen_loop) растёт от wait, а не идёт тем же
+# тактом бесконечно: любая публикация — хоть с тем же содержимым — это для
+# редиректа новое событие (WindowsClipboard.seq() растёт на любую запись,
+# docs/protocol.md 5), и повтор чаще настоящего круга туда-обратно перехватывает
+# свою же публикацию прямо перед тем, как она должна была дойти. Потолок ниже
+# _WARM_S: это активная сессия, а не фоновый heartbeat, держать её безответной
+# минутами не стоит.
+_SILENCE_BACKOFF_MAX_S = 60.0
 # Мелкие куски TCP подождать и увезти одним снимком. Полный снимок не ждёт.
 _COALESCE_S = 0.15
 # Ячеек в одном снимке шлюза. 20 ячеек протокола команд сюда не входят:
@@ -1217,6 +1225,9 @@ def listen_loop(transport, proxy_host: str, proxy_port: int, stop, wait: float,
     bias = Bias()
     ceiling = Ceiling()
     nxt = 1
+    # Растёт на каждой подряд идущей тишине (см. _SILENCE_BACKOFF_MAX_S),
+    # сбрасывается в wait, как только пришёл настоящий ответ.
+    silence_wait = wait
     try:
         while not stop.is_set():
             nxt = _accept(srv, pipes, nxt)
@@ -1260,15 +1271,17 @@ def listen_loop(transport, proxy_host: str, proxy_port: int, stop, wait: float,
                     app.warn(f"?? снимок шлюза не ушёл: {fail}")
                     time.sleep(0.2)
                 continue
-            nxt, reply, fresh = _wait_reply(transport, srv, pipes, nxt, wait)
+            nxt, reply, fresh = _wait_reply(transport, srv, pipes, nxt, silence_wait)
             if not reply:
                 if fresh or transport.paused:
                     continue
                 for pipe in pipes.values():
                     pipe.end_sent = False
-                app.warn(".. тишина шлюза, повторю снимок")
+                app.warn(f".. тишина шлюза {silence_wait:.1f} с, повторю снимок")
                 ceiling.observe(pipes)
+                silence_wait = min(_SILENCE_BACKOFF_MAX_S, silence_wait * 2)
                 continue
+            silence_wait = wait
             bias.note_peer(reply)
             apply_frames(pipes, reply, dial=False, transport=transport)
             ceiling.observe(pipes)
