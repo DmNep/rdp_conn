@@ -131,6 +131,8 @@ python tools\test_statcell.py     # служебная ячейка статис
 python tools\test_monitor.py      # чтение слота без записи
 python tools\test_tune.py         # замер паузы повтора и рабочий запас
 python tools\test_ceiling.py      # потолок снимка без буфера: ступени, потеря
+python tools\test_sim_clipboard.py  # DelayedClipboard, --slot sim:DELAY[,JITTER][:PATH]
+python tools\test_tx_wait.py      # ACK ждём по heartbeat, не по отдельному таймеру
 ```
 
 Прогонять через PowerShell, как в этом разделе: `test_duplex.py` под
@@ -166,6 +168,17 @@ git-bash/MINGW даёт ложный `FAIL` на проверке `cmd /c set` �
   сам на 10–15 с; порог молчания — `--ping` × 3, по умолчанию 25 × 3 = 75 с.
   Порог ниже `MIN_SILENCE_S = 30` помечается предупреждением, а не молча
   меряется.
+- **У `tx` был свой короткий таймер ожидания `ACK`, отдельный от heartbeat.**
+  `--wait`×`--retries` (по умолчанию 1 с×3 ≈ 3 с) — меньше самого лага
+  редиректа, поэтому живой обмен регулярно отбивался как неподтверждённый,
+  хотя собеседник был жив и просто не успел ответить (замерено на живом
+  стенде через `coder`: ~19 с от отправки до первого ответа гостя). Чинилось
+  не добавлением ещё одного порога (`gate`/`coder`/`ends` в своё время
+  обошли это костылём `wait < 8/12` для `WindowsClipboard`), а объединением:
+  пока heartbeat включён, `_confirmed`/`_confirmed_many` в `tx.py` ждут по
+  его порогу (`hb.expired()`), `--wait`/`--retries` остаются только для
+  `NAK`/порчи кадра и для прогона без heartbeat (`--ping 0`). См.
+  `docs/protocol.md` 5, регресс — `tools/test_tx_wait.py`.
 - **Кириллица — только в cp866** (`config.CODEPAGE`). В cp437 кириллицы нет
   вовсе, и `errors="replace"` превращала текст в `??????` ещё до отправки.
   Симметричные места: вывод `--exec` читается байтами и декодируется явно

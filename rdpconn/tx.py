@@ -9,6 +9,11 @@
 запись, а не за каждый кадр. Без подтверждения команда неотличима от
 потерянной, поэтому --no-ack только для отладки канала.
 
+Ожидание ACK не на своём отдельном таймере: пока heartbeat жив, порог тот
+же, что и у него (hb.expired(), docs/protocol.md 5) — он уже откалиброван
+под лаг RDP-редиректа. --wait/--retries короткие и ограничивают только
+NAK/порчу кадра и прогон без heartbeat (--ping 0), не саму тишину.
+
 Канал двусторонний, поэтому подтверждение — не единственный ожидаемый кадр.
 Чужой NOTE и PONG печатаются и попытку не тратят. NOTE с тем же seq, что у
 этой команды, попытку закрывает: ответ уже пришёл, и ждать отдельно
@@ -42,7 +47,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-ack", action="store_true",
                    help="не ждать ACK (отладка канала, надёжность ниже)")
     p.add_argument("--retries", type=int, default=config.MAX_RETRY,
-                   help=f"сколько раз повторить без подтверждения "
+                   help=f"потолок быстрых попыток на NAK/порче кадра; пока "
+                        f"heartbeat жив, на обычную тишину не влияет — порог "
+                        f"там общий с heartbeat (--ping). Без heartbeat "
+                        f"(--ping 0) — потолок попыток вообще, как раньше "
                         f"(по умолчанию {config.MAX_RETRY})")
     p.add_argument("--reply-wait", type=float, default=0.8,
                    help="сколько секунд ждать продолжение ответа после ACK "
@@ -182,27 +190,42 @@ def _pieces(text: str, codec: str, counter):
 
 
 def _confirmed(args, reader: _Reader, hb, codec: str, seq: int,
-               reply_wait: float, later: set | None = None) -> bool:
-    """Дождаться подтверждения этого seq. False — попытку надо повторить.
+               reply_wait: float, later: set | None = None) -> str:
+    """Дождаться подтверждения этого seq. 'ok' | 'retry' | 'dead'.
+
+    Пока heartbeat включён, у ожидания нет отдельного таймера: порог тот же,
+    что и у heartbeat (hb.expired(), docs/protocol.md 5) — он уже откалиброван
+    под лаг RDP-редиректа (--ping x3, не меньше MIN_SILENCE_S). Короткий
+    --wait живёт только для --ping 0 (локальные проверки, отвечать некому):
+    без heartbeat у ожидания нет другого источника правды о живости.
+
+    'retry' — попытку стоит повторить немедленно: NAK, порча кадра, чужой
+    незнакомый кадр или (без heartbeat) истёкший короткий бюджет. 'dead' —
+    heartbeat объявил собеседника потерянным; слать попытку ещё раз незачем,
+    пока он не отзовётся снова.
 
     Закрывают попытку ACK с нашим seq и NOTE с нашим seq. Чужой NOTE только
     печатается. Чужой ACK попытку не сжигает: это подтверждение не этой
     команды, и обрыв ожидания из-за него заставлял слать команду заново,
     хотя ответ ещё был в пути.
     """
-    timeout = app.wait_timeout(args)
-    deadline = time.monotonic() + timeout
     held = later or set()
     reader.release()
-    while time.monotonic() < deadline:
-        left = max(0.05, deadline - time.monotonic())
-        frame, err = reader.receive(left)
+    deadline = None if hb.enabled else time.monotonic() + app.wait_timeout(args)
+    while True:
+        wait = hb.wait(0.2) if deadline is None else max(0.05, deadline - time.monotonic())
+        frame, err = reader.receive(wait)
         if err is not None:
             app.warn(f"?? подтверждение испорчено ({err}, code={err.code:#04x})")
-            return False
+            return "retry"
         if frame is None:
-            app.warn(f".. тишина {timeout:.2f} с, подтверждения нет")
-            return False
+            if deadline is None:
+                app.heartbeat_tick(hb, reader.transport)
+                if app.heartbeat_check(hb, reader.transport):
+                    return "dead"
+                continue
+            app.warn(f".. тишина {app.wait_timeout(args):.2f} с, подтверждения нет")
+            return "retry"
         # PING собеседника обязан получить PONG даже посреди ожидания ACK:
         # иначе он объявит нас мёртвыми ровно тогда, когда мы ждём ответа.
         if app.heartbeat_handle(hb, reader.transport, frame):
@@ -214,18 +237,18 @@ def _confirmed(args, reader: _Reader, hb, codec: str, seq: int,
         if frame.type == config.ACK and frame.seq == seq:
             app.say(f"<< ACK seq={frame.seq}")
             drain_reply(reader, reply_wait, hb, codec, held)
-            return True
+            return "ok"
         if frame.type == config.NAK and frame.seq == seq:
             # Причина — байт NAK_* в payload, поэтому показываем payload как
             # есть: угадывать по длине здесь значит молча потерять причину.
             app.warn(f"<< NAK seq={frame.seq} payload={frame.payload.hex()} "
                      f"— не подтверждён, повторю")
-            return False
+            return "retry"
         if frame.type in config.REPLY_TYPES and frame.seq == seq:
             show_reply(frame, codec)
             if not drain_reply(reader, reply_wait, hb, codec, held):
                 app.say(f".. ответ seq={frame.seq} пришёл без ACK, попытка закрыта")
-            return True
+            return "ok"
         if frame.type in config.REPLY_TYPES:
             show_reply(frame, codec)
             continue
@@ -233,8 +256,7 @@ def _confirmed(args, reader: _Reader, hb, codec: str, seq: int,
             app.say(f"<< {frame.type_name} seq={frame.seq}")
             continue
         app.warn(f"?? ожидался ACK seq={seq}, получен {frame}")
-        return False
-    return False
+        return "retry"
 
 
 def _cost(text: str, codec: str):
@@ -291,25 +313,31 @@ def groups(texts, codec: str = config.CODEPAGE):
 
 
 def _confirmed_many(args, reader: _Reader, hb, codec: str, seqs,
-                    reply_wait: float) -> bool:
-    """Дождаться подтверждения каждого seq пачки. False — повторить пачку.
+                    reply_wait: float) -> str:
+    """Дождаться подтверждения каждого seq пачки. 'ok' | 'retry' | 'dead'.
 
-    Ответ приходит одной записью: ACK и NOTE каждой команды лежат в очереди
-    сразу. Пока набор не закрыт, кадр из очереди не считается тишиной.
+    Та же логика ожидания, что у _confirmed (docs/protocol.md 5, hb.expired()
+    вместо отдельного таймера, пока heartbeat включён) — здесь применена к
+    набору seq сразу: ответ на снимок из нескольких команд приходит одной
+    записью, и пока набор не закрыт, кадр из очереди не считается тишиной.
     """
     need = set(seqs)
-    timeout = app.wait_timeout(args)
-    deadline = time.monotonic() + timeout
     reader.release()
-    while need and time.monotonic() < deadline:
-        left = max(0.05, deadline - time.monotonic())
-        frame, err = reader.receive(left)
+    deadline = None if hb.enabled else time.monotonic() + app.wait_timeout(args)
+    while need:
+        wait = hb.wait(0.2) if deadline is None else max(0.05, deadline - time.monotonic())
+        frame, err = reader.receive(wait)
         if err is not None:
             app.warn(f"?? подтверждение испорчено ({err}, code={err.code:#04x})")
-            return False
+            return "retry"
         if frame is None:
-            app.warn(f".. тишина {timeout:.2f} с, подтверждения нет")
-            return False
+            if deadline is None:
+                app.heartbeat_tick(hb, reader.transport)
+                if app.heartbeat_check(hb, reader.transport):
+                    return "dead"
+                continue
+            app.warn(f".. тишина {app.wait_timeout(args):.2f} с, подтверждения нет")
+            return "retry"
         if app.heartbeat_handle(hb, reader.transport, frame):
             continue
         _back(hb)
@@ -320,7 +348,7 @@ def _confirmed_many(args, reader: _Reader, hb, codec: str, seqs,
         if frame.type == config.NAK and frame.seq in need:
             app.warn(f"<< NAK seq={frame.seq} payload={frame.payload.hex()} "
                      f"— не подтверждён, повторю")
-            return False
+            return "retry"
         if frame.type in config.REPLY_TYPES and frame.seq in need:
             show_reply(frame, codec)
             need.discard(frame.seq)
@@ -332,12 +360,9 @@ def _confirmed_many(args, reader: _Reader, hb, codec: str, seqs,
             app.say(f"<< {frame.type_name} seq={frame.seq}")
             continue
         app.warn(f"?? ожидался ACK из {sorted(need)}, получен {frame}")
-        return False
-    if need:
-        app.warn(f".. тишина {timeout:.2f} с, подтверждения нет")
-        return False
+        return "retry"
     drain_reply(reader, reply_wait, hb, codec)
-    return True
+    return "ok"
 
 
 def _send_prepared(args, transport, prepared, hb, codec: str) -> bool:
@@ -345,8 +370,18 @@ def _send_prepared(args, transport, prepared, hb, codec: str) -> bool:
 
     prepared — список команд, каждая команда — список кусков из _pieces.
     Номера кусков уже выданы: повтор пачки несёт те же seq.
+
+    Пока heartbeat жив, одно «не подтверждено» ещё не повод слать кадр снова:
+    _confirmed уже прождал весь свой heartbeat-бюджет и вернул бы 'retry'
+    только на NAK/порче/непонятном кадре — не на обычной тишине, той он
+    просто продолжает ждать. --retries здесь — потолок именно таких быстрых
+    попыток (NAK и локальный сбой записи) и, отдельно, потолок коротких
+    попыток без heartbeat (--ping 0). 'dead' всегда останавливает сразу:
+    слать кадр в уже объявленный обрыв незачем, пока собеседник не отзовётся.
     """
-    for attempt in range(1, args.retries + 1):
+    attempt = 0
+    while True:
+        attempt += 1
         frames = [framing.build_frame(config.CMD, seq, payload)
                   for pieces in prepared
                   for seq, payload, _label in pieces]
@@ -361,6 +396,8 @@ def _send_prepared(args, transport, prepared, hb, codec: str) -> bool:
             fail = app.send_frames(transport, frames)
         if fail is not None:
             app.warn(f"?? CMD не отправлен: {fail}")
+            if attempt >= args.retries:
+                return False
             continue
         for pieces in prepared:
             for seq, _payload, label in pieces:
@@ -372,13 +409,14 @@ def _send_prepared(args, transport, prepared, hb, codec: str) -> bool:
         # Ждём только последний кусок каждой команды. Промежуточный ACK
         # приёмник затирает ответом на последний.
         if len(closing) == 1:
-            ok = _confirmed(args, reader, hb, codec, closing[0], args.reply_wait, set())
+            result = _confirmed(args, reader, hb, codec, closing[0], args.reply_wait, set())
         else:
-            ok = _confirmed_many(args, reader, hb, codec, closing, args.reply_wait)
-        if ok:
+            result = _confirmed_many(args, reader, hb, codec, closing, args.reply_wait)
+        if result == "ok":
             return True
         tune.on_exchange_failed()
-    return False
+        if result == "dead" or attempt >= args.retries:
+            return False
 
 
 def send_batch(args, transport, counter, texts, hb, codec: str = config.CODEPAGE) -> bool:

@@ -148,13 +148,15 @@ python tools/test_statcell.py    # служебная ячейка статис�
 python tools/test_monitor.py     # чтение слота без записи
 python tools/test_tune.py        # замер паузы повтора и рабочий запас
 python tools/test_ceiling.py     # потолок снимка без буфера
+python tools/test_sim_clipboard.py  # искусственная задержка, --slot sim:DELAY[,JITTER][:PATH]
+python tools/test_tx_wait.py     # ACK ждём по heartbeat, не по отдельному таймеру
 python tools/bench_speed.py --win     # скорость: кадр/с, байт/с, задержка шага
 python tools/bench_speed.py --rtt-only  # задержка шага, без дочерних процессов
 python tools/bench_speed.py --remote    # бой: rx на второй машине, виден редирект
 python tools/bench_speed.py --bulk      # латентность или пропускная способность
 ```
 
-Первые десять — скрипты без зависимостей, заканчиваются строкой с `ALL GREEN`
+Первые двенадцать — скрипты без зависимостей, заканчиваются строкой с `ALL GREEN`
 (у части — `RESULT: ALL GREEN`, у части просто `ALL GREEN`, точный префикс не
 единый).
 
