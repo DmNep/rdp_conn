@@ -43,9 +43,9 @@ RDP. Буфер обмена при этом живёт внутри того ж
 paused решает крупную. busy снимается автоматически по таймауту, paused —
 только клавишей или тоже по таймауту (--pause-timeout).
 
-Хранилище отслоено (WindowsClipboard / MemoryClipboard / FileClipboard),
-чтобы вся логика — маркер, фильтрация своих кадров, занятость, пауза,
-restore — проверялась без Windows-API и без второй машины.
+Хранилище отслоено (WindowsClipboard / MemoryClipboard / FileClipboard /
+DelayedClipboard), чтобы вся логика — маркер, фильтрация своих кадров,
+занятость, пауза, restore — проверялась без Windows-API и без второй машины.
 """
 
 from __future__ import annotations
@@ -54,6 +54,7 @@ import base64
 import binascii
 import ctypes
 import os
+import random
 import secrets
 import threading
 import time
@@ -334,8 +335,65 @@ class FileClipboard:
         os.replace(tmp, self._path)
 
 
+class DelayedClipboard:
+    """Обёртка над другим слотом с искусственной задержкой публикации.
+
+    Моделирует не время вызова, а лаг самого редиректа RDP (AGENTS.md 3,6:
+    живой буфер запаздывает на 10-15 с) — запись становится видна читателю
+    не раньше чем через delay ± jitter после write(), а не сразу. Задержка
+    симметрична и видна в том числе самому писавшему: настоящий редирект для
+    удалённой стороны всегда не лучше этого, поэтому протокол, выдержавший
+    такую (более жёсткую) задержку, с запасом выдержит и живой RDP — но числа,
+    завязанные на физику самого редиректа (потолок ячеек шлюза, docs/protocol.md
+    13), эта симуляция не заменяет, только протокольную логику (heartbeat,
+    повторы, сборка сегментов).
+
+    Применение отложенной записи не требует фонового потока: он происходит
+    при следующем read()/try_read()/seq() этого же объекта, как только истёк
+    срок, — вызывающий код и так опрашивает слот в цикле, лишний поток не
+    нужен. Если запись перезаписывается до того как предыдущая успела
+    примениться — ждёт только последняя, как и в настоящем буфере: он хранит
+    одно значение, а не очередь.
+    """
+
+    def __init__(self, store, delay: float, jitter: float = 0.0) -> None:
+        self._store = store
+        self._delay = max(0.0, delay)
+        self._jitter = max(0.0, jitter)
+        self._lock = threading.Lock()
+        self._pending = None  # (срок, текст) — ещё не применённая запись
+
+    def _settle(self) -> None:
+        with self._lock:
+            if self._pending is None:
+                return
+            deadline, text = self._pending
+            if time.monotonic() < deadline:
+                return
+            self._pending = None
+        self._store.write(text)
+
+    def seq(self) -> int:
+        self._settle()
+        return self._store.seq()
+
+    def read(self):
+        self._settle()
+        return self._store.read()
+
+    def try_read(self):
+        self._settle()
+        return self._store.try_read()
+
+    def write(self, text: str) -> None:
+        delay = self._delay + (random.uniform(0.0, self._jitter) if self._jitter else 0.0)
+        with self._lock:
+            self._pending = (time.monotonic() + delay, text)
+
+
 def open_store(spec: str):
-    """По спецификации --slot: 'win' (по умолчанию), 'memory', 'file:PATH'."""
+    """По спецификации --slot: 'win' (по умолчанию), 'memory', 'file:PATH',
+    'sim:DELAY[,JITTER][:PATH]' (без PATH — поверх memory, с PATH — поверх file)."""
     if spec in ("win", "windows", "clipboard", ""):
         try:
             return WindowsClipboard()
@@ -348,7 +406,21 @@ def open_store(spec: str):
         return MemoryClipboard()
     if spec.startswith("file:"):
         return FileClipboard(spec[5:])
-    raise ClipboardError(f"неизвестный слот {spec!r}: нужно win | memory | file:PATH")
+    if spec.startswith("sim:"):
+        timing, _, path = spec[4:].partition(":")
+        delay_s, _, jitter_s = timing.partition(",")
+        try:
+            delay = float(delay_s)
+            jitter = float(jitter_s) if jitter_s else 0.0
+        except ValueError:
+            raise ClipboardError(
+                f"sim: нужна задержка числом (sim:DELAY[,JITTER][:PATH]), не {timing!r}"
+            ) from None
+        base = FileClipboard(path) if path else MemoryClipboard()
+        return DelayedClipboard(base, delay, jitter)
+    raise ClipboardError(
+        f"неизвестный слот {spec!r}: нужно win | memory | file:PATH | sim:DELAY[,JITTER][:PATH]"
+    )
 
 
 # --- горячая клавиша ---------------------------------------------------------

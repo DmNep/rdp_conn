@@ -31,7 +31,8 @@ class UsageError(Exception):
 
 def add_channel_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--slot", default="win",
-                   help="слот буфера: win | memory | file:PATH (для проверки без Windows)")
+                   help="слот буфера: win | memory | file:PATH (для проверки без Windows) | "
+                        "sim:DELAY[,JITTER][:PATH] (та же проверка плюс лаг редиректа)")
     p.add_argument("--peer-id", default=None,
                    help="метка этого конца в слоте; по умолчанию случайная, "
                         "поэтому для боя её задают явно (A и B)")
