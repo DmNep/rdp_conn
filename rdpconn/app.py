@@ -242,6 +242,10 @@ PING_MISSES = 3
 # потерянным. Значение округлено вверх от наблюдаемого на живом стенде лага в
 # 10–15 с: ниже него предупреждение перестаёт отличать обрыв от задержки.
 MIN_SILENCE_S = 30.0
+# Потолок паузы между разведывательными PING после объявления обрыва. Без
+# потолка удвоение росло бы неограниченно, и возврат собеседника после долгого
+# простоя обнаружился бы только следующей командой человека, а не само.
+RECONNECT_BACKOFF_MAX_S = 300.0
 
 
 class Heartbeat:
@@ -263,6 +267,14 @@ class Heartbeat:
     каждая запись в буферном канале — это ещё и событие RDP-редиректа; на
     медленном редиректе это превращает heartbeat в фоновый шум, который сам же
     и мешает обмену.
+
+    После объявления обрыва PING не прекращаются совсем, а идут реже: гонять
+    их с прежним интервалом в пустоту незачем, но и замолчать насовсем нельзя
+    — без единого кадра возврат собеседника не заметит никто, кроме человека,
+    который сам наберёт новую команду (а в coder/gate/ends без человека за
+    пультом такой команды и не будет). Пауза между разведывательными PING
+    удваивается от обычного интервала и останавливается на
+    RECONNECT_BACKOFF_MAX_S.
     """
 
     def __init__(self, interval: float = PING_INTERVAL_S,
@@ -278,6 +290,9 @@ class Heartbeat:
         self._last_seen = now
         self._last_ping = now
         self.alive = True
+        # Текущая пауза между разведывательными PING, пока собеседник потерян;
+        # 0, пока он жив — считать нечего, due() тогда смотрит на interval.
+        self._dead_gap = 0.0
 
     def note(self) -> bool:
         """Отметить признак жизни. True — собеседник считался потерянным.
@@ -292,6 +307,7 @@ class Heartbeat:
         self._last_seen = now
         self._last_ping = now
         self.alive = True
+        self._dead_gap = 0.0
         return revived
 
     def due(self) -> bool:
@@ -300,16 +316,20 @@ class Heartbeat:
         Сторона без proactive своих пингов не шлёт вовсе: её дело отвечать, а
         молчание собеседника она заметит и так — по порогу ниже.
 
-        Пока собеседник считается потерянным, пинги не шлём: PING в пустоту
-        ничего не проверяет, а ждать его ответа — значит держать в транспорте
-        лишние кадры для того, кого всё равно нет.
+        Пока собеседник потерян, порог не interval, а текущая пауза бэкоффа
+        (_dead_gap) — она растёт с каждым отправленным разведывательным PING,
+        см. ping().
         """
-        if not self.enabled or not self.alive or not self.proactive:
+        if not self.enabled or not self.proactive:
             return False
-        return time.monotonic() - self._last_ping >= self.interval
+        gap = self.interval if self.alive else self._dead_gap
+        return time.monotonic() - self._last_ping >= gap
 
     def ping(self) -> bytes:
         self._last_ping = time.monotonic()
+        if not self.alive:
+            self._dead_gap = min(RECONNECT_BACKOFF_MAX_S,
+                                  (self._dead_gap or self.interval) * 2)
         return framing.ping(self._ping_seq.take())
 
     def silence(self) -> float:
@@ -325,11 +345,13 @@ class Heartbeat:
 
         Просыпаться чаще, чем раз в интервал, необходимо и для детекта обрыва:
         порог в несколько интервалов иначе проверялся бы только тогда, когда
-        кадры и так идут, то есть никогда.
+        кадры и так идут, то есть никогда. Пока собеседник потерян, будить
+        цикл чаще текущей паузы бэкоффа незачем — она и так растёт.
         """
         if not self.enabled:
             return timeout
-        until_ping = self.interval - (time.monotonic() - self._last_ping)
+        gap = self.interval if self.alive else self._dead_gap
+        until_ping = gap - (time.monotonic() - self._last_ping)
         return max(0.05, min(timeout, until_ping))
 
     def resync(self) -> None:
@@ -345,8 +367,9 @@ class Heartbeat:
         self._last_ping = now
 
     def mark_lost(self) -> None:
-        """Собеседник потерян: ждать его кадр, своих пингов не слать."""
+        """Собеседник потерян: PING продолжаются, но реже (см. ping())."""
         self.alive = False
+        self._dead_gap = self.interval
         self.resync()
 
 

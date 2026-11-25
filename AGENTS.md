@@ -133,6 +133,7 @@ python tools\test_tune.py         # замер паузы повтора и ра
 python tools\test_ceiling.py      # потолок снимка без буфера: ступени, потеря
 python tools\test_sim_clipboard.py  # DelayedClipboard, --slot sim:DELAY[,JITTER][:PATH]
 python tools\test_tx_wait.py      # ACK ждём по heartbeat, не по отдельному таймеру
+python tools\test_reconnect.py    # после обрыва PING не глохнут, а идут реже
 ```
 
 Прогонять через PowerShell, как в этом разделе: `test_duplex.py` под
@@ -179,6 +180,16 @@ git-bash/MINGW даёт ложный `FAIL` на проверке `cmd /c set` �
   его порогу (`hb.expired()`), `--wait`/`--retries` остаются только для
   `NAK`/порчи кадра и для прогона без heartbeat (`--ping 0`). См.
   `docs/protocol.md` 5, регресс — `tools/test_tx_wait.py`.
+- **После объявления обрыва `due()` выключал свои `PING` насовсем.** Эмпирически
+  (не только по коду): `tx --repl` без `rx` слал три `PING`, объявлял обрыв и
+  дальше 13+ с не отправлял ни кадра. Без единого PING возврат собеседника
+  заметил бы только человек, набравший новую команду — а в `coder`/`gate`/
+  `ends` без человека за пультом канал завис бы до ручного перезапуска.
+  Починено бэкоффом: `Heartbeat._dead_gap` удваивается от `interval` на
+  каждом разведывательном `ping()`, растёт до `RECONNECT_BACKOFF_MAX_S`
+  (300 с) и сбрасывается `note()` при первом же ответе. `rx` (`proactive=False`)
+  это не касается — своих PING он и так не шлёт. См. `docs/protocol.md` 5,
+  регресс — `tools/test_reconnect.py`.
 - **Кириллица — только в cp866** (`config.CODEPAGE`). В cp437 кириллицы нет
   вовсе, и `errors="replace"` превращала текст в `??????` ещё до отправки.
   Симметричные места: вывод `--exec` читается байтами и декодируется явно
