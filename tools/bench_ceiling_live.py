@@ -1,8 +1,31 @@
 """Прогон полного снимка через живой редирект.
 
 host поднимает эхо на 127.0.0.1. guest идёт в прокси шлюза CONNECT-ом
-на этот адрес и шлёт известное число байт. Время и потолок пишутся в отчёт.
-Шлюз на обеих сторонах уже должен быть запущен.
+на этот адрес и шлёт известное число байт. Шлюз на обеих сторонах уже
+должен быть запущен.
+
+Эхо потоковое: host отвечает тем же куском сразу, как его принял, не
+дожидаясь всего тела. Без этого «туда и обратно» — единственное число,
+которое можно измерить (эхо приходит одним куском только после того, как
+host успел получить всё целиком), и оно не отличает время установления
+канала после простоя от скорости самой передачи — то и другое тонет в одной
+сумме. Потоковый эхо даёт на приёме реальную последовательность моментов
+«ещё кусок пришёл», по которой считаются и время до первого байта, и пик.
+
+Отправка тоже идёт кусками через send() (не sendall()): send эхо-канала
+ограничен окном буфера (_WINDOW в gate.py), и как только буфер шлюза
+заполняется, ОС придерживает запись в сокет — это и есть настоящее обратное
+давление канала, а не local loopback instant-write, которым раньше мерили
+«туда».
+
+Выборки времени — через time.perf_counter(), не time.monotonic() (которым
+везде в rdpconn/*.py мерят секунды и минуты, там разница не видна). Когда
+финальный снимок приносит разом десятки килобайт, локальная раздача этого
+куска гостю занимает миллисекунды, и на одной из машин стенда monotonic()
+даёт на таком отрезке одно и то же значение по нескольку вызовов подряд —
+пик тогда считался бы по нулевой длительности и показывал 0 Б/с вместо
+настоящего всплеска. perf_counter() всегда берёт самый точный таймер из
+доступных и такого не делает.
 """
 
 from __future__ import annotations
@@ -11,6 +34,7 @@ import argparse
 import hashlib
 import socket
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -25,7 +49,25 @@ def body_for(count: int) -> bytes:
     return bytes(raw[:count])
 
 
-def serve(port: int) -> None:
+def _read_exact(sock: socket.socket, count: int) -> bytes | None:
+    buf = b""
+    while len(buf) < count:
+        chunk = sock.recv(min(65536, count - len(buf)))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def serve(port: int, chunk: int) -> None:
+    """Эхо потоком: кусок пришёл — кусок сразу ушёл назад, без накопления.
+
+    Батчевое эхо (принять всё, потом отправить всё) не даёт гостю увидеть
+    ничего раньше, чем придёт целиком весь ответ, — тогда «время до первого
+    байта» и «пик» считать не по чему, оба слились бы в одно число с «туда и
+    обратно». Порядок байт при этом не меняется: гость сравнивает то, что
+    получил, с тем, что сам послал.
+    """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
@@ -44,19 +86,77 @@ def serve(port: int) -> None:
             print("нет длины", flush=True)
             return
         count = int.from_bytes(got, "big")
-        body = _read_exact(conn, count)
-        if body is None:
-            print(f"обрыв на {count}", flush=True)
+        received = 0
+        try:
+            while received < count:
+                piece = conn.recv(min(chunk, count - received))
+                if not piece:
+                    print(f"обрыв на {received} из {count}", flush=True)
+                    return
+                conn.sendall(piece)
+                received += len(piece)
+        except OSError as exc:
+            print(f"обрыв: {exc}", flush=True)
             return
-        conn.sendall(count.to_bytes(4, "big") + body)
-        print(f"эхо вернул {count} байт", flush=True)
+        print(f"эхо вернул {count} байт потоком", flush=True)
 
 
-def client(proxy: str, port: int, count: int, report: Path) -> int:
+def _send_timed(sock: socket.socket, data: bytes, chunk: int,
+                samples: list[tuple[float, int]]) -> None:
+    """send(), не sendall(): частичная отправка — уже сигнал, что канал придержал."""
+    view = memoryview(data)
+    pos = 0
+    while pos < len(view):
+        sent = sock.send(view[pos:pos + chunk])
+        pos += sent
+        samples.append((time.perf_counter(), sent))
+
+
+def _peak_rate(samples: list[tuple[float, int]], window: float) -> float:
+    """Наибольшая скорость (Б/с) в любом скользящем окне длиной window секунд.
+
+    Это оценка пика, а не среднего по всей дистанции: средним размывается
+    ровно то, что у буферного канала и так рваное — всплеск быстрой передачи
+    и установление/простой между снимками видны по отдельности, только если
+    не складывать их в одно число. Окна короче window от начала/в разрывах
+    не считаются: на огрызке времени скорость — это шум, а не измерение.
+    """
+    if len(samples) < 2:
+        return 0.0
+    times = [t for t, _ in samples]
+    sizes = [n for _, n in samples]
+    full_span = times[-1] - times[0]
+    if full_span < window:
+        # Вся выборка короче окна: окну взяться неоткуда, честнее отдать
+        # среднее по тому, что есть, чем молча вернуть 0 — короткий прогон
+        # (сам тест быстрее заданного окна) не должен выглядеть как отсутствие
+        # данных.
+        return sum(sizes) / full_span if full_span > 0 else 0.0
+    left = 0
+    total = 0
+    best = 0.0
+    for right in range(len(samples)):
+        total += sizes[right]
+        while times[right] - times[left] > window:
+            total -= sizes[left]
+            left += 1
+        # Делим на номинальную длину окна, а не на фактический разброс
+        # times[right]-times[left]: цикл выше ужимает его ровно до <= window,
+        # а не до window впритык, так что условие «разброс почти равен window»
+        # почти никогда не выполняется на редких, неравномерно разнесённых
+        # выборках — именно так пик раньше молча оставался на стартовом 0.
+        rate = total / window
+        if rate > best:
+            best = rate
+    return best
+
+
+def client(proxy: str, port: int, count: int, report: Path,
+          chunk: int, peak_window: float) -> int:
     host, _, port_s = proxy.rpartition(":")
     sock = socket.create_connection((host or "127.0.0.1", int(port_s)), 15)
     sock.settimeout(180)
-    started = time.monotonic()
+    started = time.perf_counter()
     request = (
         f"CONNECT 127.0.0.1:{port} HTTP/1.1\r\n"
         f"Host: 127.0.0.1:{port}\r\n\r\n"
@@ -64,46 +164,74 @@ def client(proxy: str, port: int, count: int, report: Path) -> int:
     sock.sendall(request)
     head = b""
     while b"\r\n\r\n" not in head and len(head) < 4096:
-        chunk = sock.recv(256)
-        if not chunk:
+        piece = sock.recv(256)
+        if not piece:
             break
-        head += chunk
-    opened = time.monotonic()
+        head += piece
+    opened = time.perf_counter()
     if b"200" not in head.split(b"\r\n", 1)[0]:
         text = f"прокси не открыл туннель: {head[:200]!r}\n"
         report.write_text(text, encoding="utf-8")
         print(text, flush=True)
         return 1
+
     body = body_for(count)
-    sock.sendall(count.to_bytes(4, "big") + body)
-    sent = time.monotonic()
-    back = _read_exact(sock, 4 + count)
-    done = time.monotonic()
-    ok = back is not None and back[4:] == body
-    upload = sent - opened
-    total = done - started
-    rate = count / upload if upload > 0 else 0
-    text = (
-        f"байт {count}\n"
-        f"туннель {opened - started:.2f} с\n"
-        f"туда {upload:.2f} с  {rate:.0f} Б/с\n"
-        f"туда и обратно {total:.2f} с\n"
-        f"эхо {'ДА' if ok else 'НЕТ'}\n"
-    )
+    up_samples: list[tuple[float, int]] = []
+    down_samples: list[tuple[float, int]] = []
+    down_buf = bytearray()
+    down_done = threading.Event()
+    down_errors: list[str] = []
+
+    def reader() -> None:
+        # Отдельный поток: читать нужно уже во время отправки, иначе первый
+        # кусок эха успеет осесть в приёмном буфере ОС до того, как мы начнём
+        # его забирать, и «время до первого байта» соврёт в меньшую сторону.
+        try:
+            while len(down_buf) < count:
+                piece = sock.recv(min(chunk, count - len(down_buf)))
+                if not piece:
+                    down_errors.append("обрыв при чтении ответа")
+                    break
+                down_buf.extend(piece)
+                down_samples.append((time.perf_counter(), len(piece)))
+        except OSError as exc:
+            down_errors.append(str(exc))
+        finally:
+            down_done.set()
+
+    threading.Thread(target=reader, daemon=True).start()
+
+    _send_timed(sock, count.to_bytes(4, "big"), chunk, up_samples)
+    _send_timed(sock, body, chunk, up_samples)
+    sent = time.perf_counter()
+
+    down_done.wait(180)
+    done = time.perf_counter()
+
+    back = bytes(down_buf) if not down_errors else None
+    ok = back is not None and back == body
+    first_byte = (down_samples[0][0] - opened) if down_samples else -1.0
+    upload_s = sent - opened
+    total_s = done - started
+    avg_rate = count / upload_s if upload_s > 0 else 0.0
+    up_peak = _peak_rate(up_samples, peak_window)
+    down_peak = _peak_rate(down_samples, peak_window)
+
+    lines = [
+        f"байт {count}",
+        f"туннель {opened - started:.2f} с (локально, не через канал)",
+        f"отправка {upload_s:.2f} с  среднее {avg_rate:.0f} Б/с",
+        f"время до первого байта ответа {first_byte:.2f} с",
+        f"туда и обратно {total_s:.2f} с",
+        f"пик отправки (окно {peak_window:g} с) {up_peak:.0f} Б/с",
+        f"пик приёма (окно {peak_window:g} с) {down_peak:.0f} Б/с",
+        f"эхо {'ДА' if ok else 'НЕТ'}" + ("" if ok else f" ({'; '.join(down_errors) or 'не совпало'})"),
+    ]
+    text = "\n".join(lines) + "\n"
     report.parent.mkdir(parents=True, exist_ok=True)
     report.write_text(text, encoding="utf-8")
     print(text, flush=True)
     return 0 if ok else 1
-
-
-def _read_exact(sock: socket.socket, count: int) -> bytes | None:
-    buf = b""
-    while len(buf) < count:
-        chunk = sock.recv(min(65536, count - len(buf)))
-        if not chunk:
-            return None
-        buf += chunk
-    return buf
 
 
 def main() -> int:
@@ -113,14 +241,19 @@ def main() -> int:
     parser.add_argument("--proxy", default="127.0.0.1:8079")
     parser.add_argument("--bytes", type=int, default=262144)
     parser.add_argument("--report", default="")
+    parser.add_argument("--chunk", type=int, default=4096,
+                        help="размер одного send()/recv() для выборки (по умолчанию 4096)")
+    parser.add_argument("--peak-window", type=float, default=1.0,
+                        help="окно для пиковой скорости в секундах (по умолчанию 1.0)")
     args = parser.parse_args()
     if args.mode == "host":
-        serve(args.port)
+        serve(args.port, args.chunk)
         return 0
     if not args.report:
         print("guest просит --report", flush=True)
         return 2
-    return client(args.proxy, args.port, args.bytes, Path(args.report))
+    return client(args.proxy, args.port, args.bytes, Path(args.report),
+                 args.chunk, args.peak_window)
 
 
 if __name__ == "__main__":
