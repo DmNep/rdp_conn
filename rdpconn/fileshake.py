@@ -83,9 +83,11 @@ def encode(op: int, body: bytes, nonce: bytes) -> bytes:
 
 
 def decode(payload: bytes):
+    """(op, nonce, body) — nonce отдельно, не слит в body: wait_result()/offer()
+    сверяют его с тем, что сами отправили, прежде чем доверять кадру."""
     if len(payload) < _HEAD or payload[:2] != MAGIC:
         return None
-    return payload[2], payload[_HEAD:]
+    return payload[2], payload[3:_HEAD], payload[_HEAD:]
 
 
 def _note(raw: bytes):
@@ -104,6 +106,11 @@ class Offer:
     files: list[tuple[str, int]]
     chunk: int
     estimate_s: float
+    # Nonce кадра FILE_OFFER, из которого собран этот Offer — тот же, что
+    # получатель обязан эхом вернуть в FILE_READY/FILE_DONE/FILE_FAIL (см.
+    # wait_offer()), чтобы отправитель мог отличить ответ на ЭТОТ offer от
+    # случайного старого кадра той же пары op в истории слота.
+    nonce: bytes = b""
 
     @property
     def total_bytes(self) -> int:
@@ -142,7 +149,8 @@ class Handshake:
         if not entries:
             raise HandshakeError("offer() без файлов")
         offer = Offer(files=entries, chunk=chunk,
-                      estimate_s=round(sum(s for _, s in entries) / ASSUMED_BPS, 2))
+                      estimate_s=round(sum(s for _, s in entries) / ASSUMED_BPS, 2),
+                      nonce=self._nonce)
         body = json.dumps({"f": entries, "c": chunk, "e": offer.estimate_s},
                           ensure_ascii=False).encode("utf-8")
         if len(body) > config.MAX_PAYLOAD - _HEAD:
@@ -161,7 +169,11 @@ class Handshake:
             parsed = _note(raw)
             if parsed is None:
                 continue
-            op, payload = parsed
+            op, nonce, payload = parsed
+            if nonce != self._nonce:
+                # Чужой или устаревший обмен (тот же op, но не наш FILE_OFFER) —
+                # лежит в истории слота от прошлой попытки/процесса; не наш ответ.
+                continue
             if op == OP_READY:
                 return offer
             if op == OP_FAIL:
@@ -170,7 +182,17 @@ class Handshake:
         raise HandshakeError("FILE_READY не дождались")
 
     def wait_result(self, timeout: float) -> list[tuple[str, int, str]]:
-        """После send_files() — дождаться FILE_DONE. Бросает HandshakeError на FAIL/таймаут."""
+        """После send_files() — дождаться FILE_DONE. Бросает HandshakeError на FAIL/таймаут.
+
+        nonce сверяется с self._nonce (тем же, что ушёл в FILE_OFFER): без
+        этого первый же OP_DONE/OP_FAIL в очереди receive() принимался за
+        ответ на ТЕКУЩУЮ передачу, даже если это случайный старый кадр той
+        же пары op, оставшийся в истории слота от не связанной попытки —
+        живой случай 27.11.2026, см. память проекта: host считал файл
+        доставленным по чужому `{"f": []}` с прошлой попытки, пока настоящий
+        FILE_FAIL этой самой передачи лежал в очереди следом и не был
+        прочитан.
+        """
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             raw = self.transport.receive(max(0.0, deadline - time.monotonic()))
@@ -179,7 +201,9 @@ class Handshake:
             parsed = _note(raw)
             if parsed is None:
                 continue
-            op, body = parsed
+            op, nonce, body = parsed
+            if nonce != self._nonce:
+                continue
             if op == OP_DONE:
                 return [tuple(e) for e in json.loads(body.decode("utf-8"))["f"]]
             if op == OP_FAIL:
@@ -190,7 +214,16 @@ class Handshake:
     # --- получатель файлов -----------------------------------------------
 
     def wait_offer(self, timeout: float | None = None) -> Offer | None:
-        """Ждать FILE_OFFER. None — не дождались за timeout (None — ждать, пока не придёт)."""
+        """Ждать FILE_OFFER. None — не дождались за timeout (None — ждать, пока не придёт).
+
+        Принимает первый попавшийся OP_OFFER вне зависимости от nonce —
+        получатель ещё не знает, какой обмен "свой", он как раз начинается
+        этим кадром. С этого момента self._nonce принимает значение кадра
+        (не своё, сгенерированное в __init__): accept()/decline()/
+        report_done()/report_fail() дальше эхо'ят именно его, чтобы
+        отправитель в offer()/wait_result() мог отличить ответ на ЭТОТ
+        offer от случайного кадра той же пары op из прошлой попытки.
+        """
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
             if deadline is not None:
@@ -205,11 +238,13 @@ class Handshake:
             parsed = _note(raw)
             if parsed is None:
                 continue
-            op, body = parsed
+            op, nonce, body = parsed
             if op != OP_OFFER:
                 continue
+            self._nonce = nonce
             obj = json.loads(body.decode("utf-8"))
-            return Offer(files=[tuple(e) for e in obj["f"]], chunk=obj["c"], estimate_s=obj["e"])
+            return Offer(files=[tuple(e) for e in obj["f"]], chunk=obj["c"], estimate_s=obj["e"],
+                        nonce=nonce)
 
     def accept(self) -> None:
         fail = self._send(OP_READY)
@@ -395,9 +430,17 @@ class DropWatcher:
         parsed = _note(raw)
         if parsed is None or parsed[0] != OP_OFFER:
             return
-        obj = json.loads(parsed[1].decode("utf-8"))
-        offer = Offer(files=[tuple(e) for e in obj["f"]], chunk=obj["c"], estimate_s=obj["e"])
+        _op, nonce, body = parsed
+        obj = json.loads(body.decode("utf-8"))
+        offer = Offer(files=[tuple(e) for e in obj["f"]], chunk=obj["c"], estimate_s=obj["e"],
+                     nonce=nonce)
         hs = Handshake(self.transport)
+        # Эхо nonce'а из offer, не свой свежий: offer()/wait_result() на
+        # стороне отправителя сверяют его с тем, что сами послали в
+        # FILE_OFFER — своим нонсом здесь FILE_READY/FILE_DONE выглядел бы
+        # для них чужим кадром и был бы молча пропущен (см. docstring
+        # wait_offer()).
+        hs._nonce = nonce
         hs.accept()
         self.inbox.mkdir(parents=True, exist_ok=True)
         try:

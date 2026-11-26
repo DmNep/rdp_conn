@@ -49,15 +49,19 @@ def make_files(sizes: list[int]) -> list[str]:
 print("=== 1. encode/decode F1 ===")
 raw = encode(1, b"hello", b"NNNN")
 parsed = decode(raw)
-check("op и тело совпали", parsed == (1, b"hello"), repr(parsed))
+check("op, nonce и тело совпали", parsed == (1, b"NNNN", b"hello"), repr(parsed))
 check("чужая магия не разбирается", decode(b"XXhello12345") is None)
 check("короткий payload не разбирается", decode(b"F") is None)
 
-print("=== 1b. одинаковый payload, разный nonce -> разные байты кадра ===")
+print("=== 1b. одинаковый payload, разный nonce -> разные байты кадра и разный nonce в decode() ===")
 same_a = encode(1, b"same body", b"aaaa")
 same_b = encode(1, b"same body", b"bbbb")
 check("nonce меняет байты кадра", same_a != same_b, (same_a, same_b))
-check("оба разбираются в одно и то же", decode(same_a) == decode(same_b) == (1, b"same body"))
+dec_a, dec_b = decode(same_a), decode(same_b)
+check("op и тело совпали несмотря на разный nonce",
+     dec_a[0] == dec_b[0] == 1 and dec_a[2] == dec_b[2] == b"same body", (dec_a, dec_b))
+check("а вот nonce в decode() — разный (на нём и держится проверка в wait_result()/offer())",
+     dec_a[1] != dec_b[1], (dec_a[1], dec_b[1]))
 
 print("=== 2. offer -> accept -> ready ===")
 sender, receiver = pair()
@@ -119,39 +123,79 @@ try:
 except HandshakeError as exc:
     check("таймаут offer()", "READY" in str(exc), str(exc))
 
-print("=== 5. report_done -> wait_result ===")
+print("=== 5. report_done -> wait_result (через настоящий offer/accept, не в обход) ===")
 sender, receiver = pair()
-expected = [("f0.bin", 100, "aa" * 32), ("f1.bin", 200, "bb" * 32)]
+paths5 = make_files([100, 200])
+expected = [(Path(paths5[0]).name, 100, "aa" * 32), (Path(paths5[1]).name, 200, "bb" * 32)]
 
 
 def do_report():
-    receiver.report_done(expected)
+    offer = receiver.wait_offer(5.0)
+    if offer is not None:
+        receiver.accept()
+        receiver.report_done(expected)
 
 
 thread = threading.Thread(target=do_report)
 thread.start()
 try:
+    sender.offer(paths5, ready_timeout=5.0)
     got = sender.wait_result(5.0)
     check("результат совпал", got == expected, got)
 except HandshakeError as exc:
     check("результат совпал", False, str(exc))
 thread.join(5)
 
-print("=== 6. report_fail -> wait_result бросает с причиной ===")
+print("=== 6. report_fail -> wait_result бросает с причиной (через настоящий offer/accept) ===")
 sender, receiver = pair()
+paths6 = make_files([10])
 
 
 def do_fail():
-    receiver.report_fail("буфер побило")
+    offer = receiver.wait_offer(5.0)
+    if offer is not None:
+        receiver.accept()
+        receiver.report_fail("буфер побило")
 
 
 thread = threading.Thread(target=do_fail)
 thread.start()
 try:
+    sender.offer(paths6, ready_timeout=5.0)
     sender.wait_result(5.0)
     check("report_fail виден отправителю", False)
 except HandshakeError as exc:
     check("report_fail виден отправителю", "буфер побило" in str(exc), str(exc))
+thread.join(5)
+
+print("=== 6b. wait_result игнорирует чужой/старый OP_DONE с другим nonce ===")
+sender, receiver = pair()
+# Та же сторона (peer_id "B", как у receiver), но другой Handshake и свой
+# nonce — имитирует кадр, оставшийся в истории слота от не связанной
+# попытки. transport общий с receiver (тот же peer_id), поэтому для
+# sender.wait_result() это "чужой", не "свой", кадр — как и было бы на
+# живом стенде.
+stale_hs = Handshake(receiver.transport)
+stale_hs.report_done([("stale.bin", 1, "00" * 32)])  # кадр с OP_DONE уже лежит в слоте
+
+
+def do_report_7():
+    offer = receiver.wait_offer(5.0)
+    if offer is not None:
+        receiver.accept()
+        receiver.report_done(expected)
+
+
+paths7 = make_files([100, 200])
+thread = threading.Thread(target=do_report_7)
+thread.start()
+try:
+    sender.offer(paths7, ready_timeout=5.0)
+    got = sender.wait_result(5.0)
+    check("настоящий результат дошёл, а не чужой устаревший OP_DONE",
+         got == expected, got)
+except HandshakeError as exc:
+    check("настоящий результат дошёл, а не чужой устаревший OP_DONE", False, str(exc))
 thread.join(5)
 
 print("=== 7. wait_result без ответа — таймаут ===")
