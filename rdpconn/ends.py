@@ -11,7 +11,7 @@ import argparse
 import sys
 import threading
 
-from . import app, coder, fileshake, gate, monitor
+from . import app, coder, fileclip, fileshake, gate, monitor
 from .statcell import FEED_MODEL, FEED_NET, PAGE, Picture, attach_guest
 
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
@@ -143,6 +143,14 @@ def _guest_with_drop(link, once_path, watcher) -> int:
     stop = threading.Event()
 
     def poll() -> None:
+        # COM — per-thread, не per-process: module-level OleInitialize() в
+        # fileclip.py представил только тот поток, что импортировал модуль
+        # (обычно главный), не этот. Без этого здесь — не понятный
+        # CO_E_NOTINITIALIZED (легко поймать), а периодический
+        # CLIPBRD_E_BAD_DATA на GetData(FileContents): список файлов
+        # читается нормально, сам файл — нет (живой фикс 27.11.2026, см.
+        # комментарий у ole32.OleInitialize в fileclip.py).
+        fileclip.ensure_com_initialized()
         while not stop.is_set():
             # tick() сам пишет в транспорт (FILE_READY, сама передача) —
             # лочить только receive() мало, иначе run_locked() в guest_loop()

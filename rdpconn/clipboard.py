@@ -757,6 +757,14 @@ class ClipboardTransport:
         self._pending = []
         self._lock = threading.Lock()
         self._paused_at = None
+        # Окно, когда receive() не трогает буфер вовсе — ни seq(), ни read().
+        # Сильнее paused: та пауза блокирует только запись (приём по
+        # прежнему читает, см. докстринг pause()); для F1 (fileshake.py)
+        # этого не хватило — свой же классический GetClipboardData во
+        # время wait_result() способен сорвать ещё не отданный FileContents
+        # того же буфера (HRESULT 0x80040064, см. память проекта). См.
+        # suspend_reads().
+        self._reads_suspended_until = 0.0
         self._pause_timeout = pause_timeout
         self._restore = restore
         # Кнопка паузы меняет поведение молча, а молчание обмена выглядит как
@@ -904,6 +912,23 @@ class ClipboardTransport:
             except Exception as exc:
                 from . import app
                 app.warn(f"!! сигнал продолжения: {exc}")
+
+    def suspend_reads(self, duration: float) -> None:
+        """Ближайшие duration секунд receive() не трогает буфер вовсе.
+
+        Не то же самое, что pause(): та оставляет чтение разрешённым
+        ("приём ничего не ломает"), а для F1 (fileshake.py) это оказалось
+        не так — собственный классический GetClipboardData во время
+        ожидания FILE_DONE способен сорвать ещё не отданный FileContents
+        того же буфера (HRESULT 0x80040064, живой фикс 27.11.2026: пауза
+        только записи не спасала, вызывающая сторона всё равно опрашивала
+        буфер в ожидании ответа). Новый вызов продлевает срок, но не
+        укорачивает — два источника (например, send_files() и его
+        собственный повтор) не должны отменять друг друга по ошибке.
+        """
+        until = time.monotonic() + max(0.0, duration)
+        if until > self._reads_suspended_until:
+            self._reads_suspended_until = until
 
     def note_paste(self) -> None:
         """Вставка случилась: канал ещё немного молчит, затем возвращается.
@@ -1056,7 +1081,12 @@ class ClipboardTransport:
         return None
 
     def receive(self, timeout: float):
-        """Ждать кадр. Читает и в паузе тоже — см. пояснение к pause()."""
+        """Ждать кадр. Читает и в паузе тоже — см. пояснение к pause().
+
+        Исключение — suspend_reads(): пока её срок не вышел, дальше этой
+        точки не идём вовсе (ни seq(), ни read()), отдаём только то, что
+        уже лежит в self._pending из более раннего чтения.
+        """
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
             self._expire()
@@ -1066,6 +1096,13 @@ class ClipboardTransport:
 
             if self._pending:
                 return self._deliver(self._pending.pop(0))
+
+            now = time.monotonic()
+            if now < self._reads_suspended_until:
+                if now >= deadline:
+                    return None
+                time.sleep(min(POLL_S, self._reads_suspended_until - now, deadline - now))
+                continue
 
             # Новая копия уже сменила номер слота. Повтор своей записи
             # в этот же заход стёр бы её раньше, чем мы успели её прочитать.

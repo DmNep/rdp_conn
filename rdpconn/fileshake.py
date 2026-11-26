@@ -61,6 +61,16 @@ _HEAD = 2 + 1 + _NONCE_LEN  # magic(2) + op(1) + nonce(4)
 # тюнинга самой передачи.
 ASSUMED_BPS = 5_000_000
 
+# Минимум паузы ЧТЕНИЯ у отправителя после публикации файла (см.
+# transport.suspend_reads() в send_files()) — не меньше документированного
+# лага RDP-редиректа (10-15 с, docs/protocol.md 5, тот же порог, что уже
+# принят для --ping x3): опрос буфера в ожидании FILE_DONE прерывается не
+# потому, что файл большой, а потому, что собеседник может быть ещё за
+# редиректом — свой же классический GetClipboardData в это время способен
+# сорвать ещё не отданный FileContents (HRESULT 0x80040064, живой фикс
+# 27.11.2026), даже у маленького файла с estimate_s≈0.
+_READ_SUSPEND_FLOOR_S = 10.0
+
 
 class HandshakeError(Exception):
     """Рукопожатие не состоялось: таймаут или явный отказ собеседника."""
@@ -244,19 +254,26 @@ def send_files(transport, paths: list[str | Path], *, chunk: int = 524288,
     pause=True — поставить ClipboardTransport.pause() вокруг fileclip.send_files()
     и wait_result(): offer() пишет в тот же транспорт (FILE_OFFER) и поэтому
     остаётся снаружи паузы — поставить его под паузу значило бы, что
-    собственный FILE_OFFER дожидается самого себя. wait_result() же только
-    читает (receive()), пауза ему не мешает — но держать её, пока не придёт
-    FILE_DONE/FAIL, важно: resume() (ClipboardTransport._reconcile()) сам
-    читает буфер классическим GetClipboardData(CF_UNICODETEXT), и если
-    сделать это сразу после OleSetClipboard, не дождавшись, что собеседник
-    (возможно, ещё за RDP-редиректом) дочитал FileContents, этот лишний
-    классический GetClipboardData способен сорвать ещё не отданный
-    delay-render — живьём (27.11.2026) ловилось GetData(cf=49272, FileContents)
-    на стороне получателя, HRESULT 0x80040064, именно при resume() сразу после
-    send_files(), а не при resume() после wait_result(). Нужно только там,
-    где транспорт делят с чужим фоновым писателем в этом же процессе
-    (DropWatcher в ends.py); самостоятельный `python -m rdpconn.fileshake send`
-    им не делится ни с кем.
+    собственный FILE_OFFER дожидается самого себя. Нужно только там, где
+    транспорт делят с чужим фоновым писателем в этом же процессе (DropWatcher
+    в ends.py); самостоятельный `python -m rdpconn.fileshake send` им не
+    делится ни с кем — но suspend_reads() ниже применяется всегда, не только
+    при pause=True: это не про дележ транспорта с соседом, а про то, что
+    собственный receive() и в одиночку способен сорвать свою же передачу.
+
+    27.11.2026, два фикса подряд на одном и том же HRESULT 0x80040064 — для
+    памяти, чтобы не повторить по кругу:
+    1) `resume()` переставлен ПОСЛЕ wait_result() вместо сразу после
+       send_files() — не хватило: `_reconcile()`'s один классический
+       GetClipboardData был не единственным источником гонки.
+    2) Настоящая причина шире: `receive()` по конструкции читает буфер
+       классическим API даже во время паузы (пауза блокирует только запись,
+       см. докстринг `pause()`) — а wait_result() обязан звать receive()
+       в цикле, пока не придёт FILE_DONE/FAIL, то есть всё это время
+       (минимум result_timeout) собственный опрос конкурирует с ещё не
+       отданным FileContents того же буфера. Живой фикс — `suspend_reads()`
+       (clipboard.py): отдельное, более сильное окно, где receive() не
+       трогает буфер вовсе, не только не пишет.
     """
     hs = Handshake(transport)
     offer = hs.offer(paths, chunk=chunk, ready_timeout=ready_timeout)
@@ -275,6 +292,12 @@ def send_files(transport, paths: list[str | Path], *, chunk: int = 524288,
         transport.pause()
     try:
         fileclip.send_files(paths)
+        # Не меньше _READ_SUSPEND_FLOOR_S даже для крошечного файла (лаг
+        # редиректа и ретраи получателя не зависят от размера), не больше
+        # result_timeout минус запас на сам финальный опрос FILE_DONE/FAIL.
+        suspend_s = min(max(0.0, result_timeout - 2.0),
+                        max(_READ_SUSPEND_FLOOR_S, offer.estimate_s * 3))
+        transport.suspend_reads(suspend_s)
         return hs.wait_result(result_timeout)
     finally:
         if pause:
