@@ -299,11 +299,32 @@ def _ole_get_clipboard(*, open_retries: int = 10, open_retry_wait: float = 0.1) 
     raise last_err  # недостижимо
 
 
-def list_clipboard_files(*, open_retries: int = 10, open_retry_wait: float = 0.1) -> list[FileEntry]:
-    """FileGroupDescriptorW: имена и размеры, без скачивания содержимого."""
+def list_clipboard_files(*, open_retries: int = 10, open_retry_wait: float = 0.1,
+                         formatetc_retries: int = 15, formatetc_retry_wait: float = 0.1) -> list[FileEntry]:
+    """FileGroupDescriptorW: имена и размеры, без скачивания содержимого.
+
+    formatetc_retries — тот же гоночный случай, что у `recv_file()`'s
+    `GetData(FileContents)`: `IsClipboardFormatAvailable` в `wait_for_new_file()`
+    видит `FileGroupDescriptorW` чуть раньше, чем сам `GetData` этого же формата
+    успевает честно ответить — редиректор публикует флаг доступности и сами
+    данные не одним атомарным шагом. Поймано живьём: сразу после обнаружения
+    нового файла `GetData` падал `DV_E_CLIPFORMAT`, хотя `IsClipboardFormatAvailable`
+    секундой раньше отвечал "да".
+    """
     cf_fgd = user32.RegisterClipboardFormatW("FileGroupDescriptorW")
     ppdo = _ole_get_clipboard(open_retries=open_retries, open_retry_wait=open_retry_wait)
-    med = _get_data(ppdo, cf_fgd, -1, (_TYMED_HGLOBAL, _TYMED_ISTREAM))
+    med = None
+    last_err: ClipboardFileError | None = None
+    for attempt in range(formatetc_retries):
+        try:
+            med = _get_data(ppdo, cf_fgd, -1, (_TYMED_HGLOBAL, _TYMED_ISTREAM))
+            break
+        except ClipboardFileError as exc:
+            last_err = exc
+            app.trace("fileclip-list-retry", attempt=attempt, error=str(exc))
+            time.sleep(formatetc_retry_wait)
+    if med is None:
+        raise last_err
     rec = ctypes.sizeof(_FILEDESCRIPTORW)
     if med.tymed == _TYMED_ISTREAM:
         data = _read_stream_all(med.data)
