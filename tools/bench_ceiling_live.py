@@ -59,7 +59,8 @@ def _read_exact(sock: socket.socket, count: int) -> bytes | None:
     return buf
 
 
-def serve(port: int, chunk: int) -> None:
+def serve(port: int, chunk: int, echo: bool = True,
+         report: Path | None = None, peak_window: float = 1.0) -> None:
     """Эхо потоком: кусок пришёл — кусок сразу ушёл назад, без накопления.
 
     Батчевое эхо (принять всё, потом отправить всё) не даёт гостю увидеть
@@ -67,18 +68,27 @@ def serve(port: int, chunk: int) -> None:
     байта» и «пик» считать не по чему, оба слились бы в одно число с «туда и
     обратно». Порядок байт при этом не меняется: гость сравнивает то, что
     получил, с тем, что сам послал.
+
+    echo=False — только приём, без ответа. Это единственная сторона, на
+    которой «скорость передачи файла в одну сторону» вообще можно честно
+    измерить: приём не обогнать локальной буферизацией, байт долетает только
+    после того, как реально пересёк канал (см. docstring client() про то же
+    самое в обратном направлении). guest-овская сторона с этой ролью не
+    справится — её send() может быть мгновенным ещё до того, как канал
+    принял хоть байт.
     """
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("127.0.0.1", port))
     srv.listen(1)
     srv.settimeout(180)
-    print(f"эхо 127.0.0.1:{port}", flush=True)
+    print(f"эхо 127.0.0.1:{port}" if echo else f"приёмник 127.0.0.1:{port}", flush=True)
     try:
         conn, _addr = srv.accept()
     except socket.timeout:
         print("никто не пришёл", flush=True)
         return
+    accepted = time.perf_counter()
     with conn:
         conn.settimeout(180)
         got = _read_exact(conn, 4)
@@ -87,18 +97,38 @@ def serve(port: int, chunk: int) -> None:
             return
         count = int.from_bytes(got, "big")
         received = 0
+        samples: list[tuple[float, int]] = []
         try:
             while received < count:
                 piece = conn.recv(min(chunk, count - received))
                 if not piece:
                     print(f"обрыв на {received} из {count}", flush=True)
                     return
-                conn.sendall(piece)
+                if echo:
+                    conn.sendall(piece)
+                samples.append((time.perf_counter(), len(piece)))
                 received += len(piece)
         except OSError as exc:
             print(f"обрыв: {exc}", flush=True)
             return
-        print(f"эхо вернул {count} байт потоком", flush=True)
+        if echo:
+            print(f"эхо вернул {count} байт потоком", flush=True)
+            return
+        first_byte = samples[0][0] - accepted if samples else -1.0
+        total_s = samples[-1][0] - accepted if samples else 0.0
+        avg_rate = count / total_s if total_s > 0 else 0.0
+        peak = _peak_rate(samples, peak_window)
+        lines = [
+            f"байт {count}",
+            f"время до первого байта {first_byte:.2f} с",
+            f"приём {total_s:.2f} с  среднее {avg_rate:.0f} Б/с",
+            f"пик приёма (окно {peak_window:g} с) {peak:.0f} Б/с",
+        ]
+        text = "\n".join(lines) + "\n"
+        print(text, flush=True)
+        if report is not None:
+            report.parent.mkdir(parents=True, exist_ok=True)
+            report.write_text(text, encoding="utf-8")
 
 
 def _send_timed(sock: socket.socket, data: bytes, chunk: int,
@@ -152,7 +182,15 @@ def _peak_rate(samples: list[tuple[float, int]], window: float) -> float:
 
 
 def client(proxy: str, port: int, count: int, report: Path,
-          chunk: int, peak_window: float) -> int:
+          chunk: int, peak_window: float, echo: bool = True) -> int:
+    """echo=False: только отправка, без ожидания ответа.
+
+    Цифры этой стороны (отправка/пик отправки) при echo=False не доказывают
+    скорость канала — send() может отработать мгновенно в локальный буфер ОС
+    и буфер gate.py ещё до того, как канал принял хоть байт (см. _send_timed).
+    Настоящее число для одной стороны — на host (serve(..., echo=False)):
+    приём не обогнать локальной буферизацией.
+    """
     host, _, port_s = proxy.rpartition(":")
     sock = socket.create_connection((host or "127.0.0.1", int(port_s)), 15)
     sock.settimeout(180)
@@ -177,6 +215,26 @@ def client(proxy: str, port: int, count: int, report: Path,
 
     body = body_for(count)
     up_samples: list[tuple[float, int]] = []
+
+    if not echo:
+        _send_timed(sock, count.to_bytes(4, "big"), chunk, up_samples)
+        _send_timed(sock, body, chunk, up_samples)
+        sent = time.perf_counter()
+        upload_s = sent - opened
+        avg_rate = count / upload_s if upload_s > 0 else 0.0
+        up_peak = _peak_rate(up_samples, peak_window)
+        lines = [
+            f"байт {count}",
+            f"отправка (локально, не доказывает скорость канала) {upload_s:.2f} с"
+            f"  среднее {avg_rate:.0f} Б/с  пик {up_peak:.0f} Б/с",
+            "настоящая скорость одной стороны — в отчёте host (serve с --no-echo)",
+        ]
+        text = "\n".join(lines) + "\n"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text(text, encoding="utf-8")
+        print(text, flush=True)
+        return 0
+
     down_samples: list[tuple[float, int]] = []
     down_buf = bytearray()
     down_done = threading.Event()
@@ -245,15 +303,21 @@ def main() -> int:
                         help="размер одного send()/recv() для выборки (по умолчанию 4096)")
     parser.add_argument("--peak-window", type=float, default=1.0,
                         help="окно для пиковой скорости в секундах (по умолчанию 1.0)")
+    parser.add_argument("--no-echo", action="store_true",
+                        help="только одна сторона: host лишь принимает, guest лишь "
+                             "шлёт — измерение скорости в одну сторону, не туда-обратно "
+                             "(настоящая цифра — в отчёте host, см. docstring serve())")
     args = parser.parse_args()
+    echo = not args.no_echo
     if args.mode == "host":
-        serve(args.port, args.chunk)
+        report = Path(args.report) if args.report else None
+        serve(args.port, args.chunk, echo=echo, report=report, peak_window=args.peak_window)
         return 0
     if not args.report:
         print("guest просит --report", flush=True)
         return 2
     return client(args.proxy, args.port, args.bytes, Path(args.report),
-                 args.chunk, args.peak_window)
+                 args.chunk, args.peak_window, echo=echo)
 
 
 if __name__ == "__main__":
