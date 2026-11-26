@@ -200,26 +200,39 @@ class FileEntry:
     size: int
 
 
-def send_file(path: str | Path, *, flush_retries: int = 5, flush_retry_wait: float = 0.2) -> None:
-    """Положить файл в буфер как Проводник: Ctrl+C на одном файле.
+def send_files(paths: list[str | Path], *, flush_retries: int = 5, flush_retry_wait: float = 0.2) -> None:
+    """Положить несколько файлов в буфер разом — `FileGroupDescriptorW.cItems > 1`,
+    как при выделении нескольких файлов в Проводнике и Ctrl+C.
 
-    flush_retries — `OleFlushClipboard` иногда ловит CLIPBRD_E_CANT_OPEN на
-    чужой короткой блокировке буфера (другой процесс только что читал или
-    писал); это гонка, а не настоящая ошибка, retry с паузой её снимает.
+    Все файлы обязаны лежать в одной папке: `SHCreateDataObject` принимает
+    ровно один `pidl` папки-родителя и массив child-`pidl` относительно
+    него — это ограничение самого shell API (PIDL ребёнка однозначен только
+    внутри своего родителя), не наше; файлы из разных папок этим вызовом не
+    собрать в один объект буфера.
+
+    flush_retries — см. докстринг `send_file()`: то же самое, тот же retry.
     """
-    path = str(Path(path).resolve())
-    pidl_full = shell32.ILCreateFromPathW(path)
-    if not pidl_full:
-        raise ClipboardFileError(f"ILCreateFromPathW({path!r}) вернул NULL — файла нет?")
+    resolved = [str(Path(p).resolve()) for p in paths]
+    if not resolved:
+        raise ClipboardFileError("send_files() вызван без путей")
+    parents = {str(Path(p).parent) for p in resolved}
+    if len(parents) > 1:
+        raise ClipboardFileError(
+            f"все файлы должны быть в одной папке (ограничение SHCreateDataObject), "
+            f"получили папки: {sorted(parents)}")
+    pidls_full = [shell32.ILCreateFromPathW(p) for p in resolved]
     try:
-        child = shell32.ILFindLastID(pidl_full)
-        pidl_folder = shell32.ILClone(pidl_full)
+        for p, pidl in zip(resolved, pidls_full):
+            if not pidl:
+                raise ClipboardFileError(f"ILCreateFromPathW({p!r}) вернул NULL — файла нет?")
+        children = [shell32.ILFindLastID(pidl) for pidl in pidls_full]
+        pidl_folder = shell32.ILClone(pidls_full[0])
         try:
             shell32.ILRemoveLastID(pidl_folder)
             ppv = ctypes.c_void_p()
-            apidl = (ctypes.c_void_p * 1)(child)
+            apidl = (ctypes.c_void_p * len(children))(*children)
             hr = shell32.SHCreateDataObject(
-                ctypes.c_void_p(pidl_folder), 1, apidl, None,
+                ctypes.c_void_p(pidl_folder), len(children), apidl, None,
                 ctypes.byref(_IID_IDataObject), ctypes.byref(ppv))
             _check(hr, "SHCreateDataObject")
             hr = ole32.OleSetClipboard(ppv)
@@ -240,8 +253,20 @@ def send_file(path: str | Path, *, flush_retries: int = 5, flush_retry_wait: flo
         finally:
             shell32.ILFree(pidl_folder)
     finally:
-        shell32.ILFree(pidl_full)
-    app.trace("fileclip-send", path=path, size=os.path.getsize(path))
+        for pidl in pidls_full:
+            if pidl:
+                shell32.ILFree(pidl)
+    app.trace("fileclip-send", paths=resolved, count=len(resolved),
+             total_size=sum(os.path.getsize(p) for p in resolved))
+
+
+def send_file(path: str | Path, *, flush_retries: int = 5, flush_retry_wait: float = 0.2) -> None:
+    """Положить один файл в буфер как Проводник: Ctrl+C на одном файле.
+
+    Тонкая обёртка над `send_files([path])` — один файл - частный случай
+    нескольких, не отдельный путь в коде.
+    """
+    send_files([path], flush_retries=flush_retries, flush_retry_wait=flush_retry_wait)
 
 
 def sequence_number() -> int:
@@ -250,12 +275,34 @@ def sequence_number() -> int:
     return user32.GetClipboardSequenceNumber()
 
 
-def list_clipboard_files() -> list[FileEntry]:
+def _ole_get_clipboard(*, open_retries: int = 10, open_retry_wait: float = 0.1) -> ctypes.c_void_p:
+    """`OleGetClipboard` с retry — та же гонка за `OpenClipboard`, что у
+    `OleFlushClipboard()` в `send_files()`, только на стороне приёма: другой
+    процесс (сам RDP-редиректор или наш же сосед) может на мгновение держать
+    буфер открытым сразу после публикации нового содержимого. Пойман живьём:
+    `list_clipboard_files()` падал `CLIPBRD_E_CANT_OPEN` сразу после того, как
+    `wait_for_new_file()` увидел смену `seq()` — то есть ровно тогда, когда
+    редиректор мог ещё не закрыть буфер после своей записи.
+    """
+    ppdo = ctypes.c_void_p()
+    last_err: OSError | None = None
+    for attempt in range(open_retries):
+        try:
+            hr = ole32.OleGetClipboard(ctypes.byref(ppdo))
+            _check(hr, "OleGetClipboard")
+            return ppdo
+        except OSError as exc:
+            last_err = exc
+            if attempt == open_retries - 1:
+                raise
+            time.sleep(open_retry_wait)
+    raise last_err  # недостижимо
+
+
+def list_clipboard_files(*, open_retries: int = 10, open_retry_wait: float = 0.1) -> list[FileEntry]:
     """FileGroupDescriptorW: имена и размеры, без скачивания содержимого."""
     cf_fgd = user32.RegisterClipboardFormatW("FileGroupDescriptorW")
-    ppdo = ctypes.c_void_p()
-    hr = ole32.OleGetClipboard(ctypes.byref(ppdo))
-    _check(hr, "OleGetClipboard")
+    ppdo = _ole_get_clipboard(open_retries=open_retries, open_retry_wait=open_retry_wait)
     med = _get_data(ppdo, cf_fgd, -1, (_TYMED_HGLOBAL, _TYMED_ISTREAM))
     rec = ctypes.sizeof(_FILEDESCRIPTORW)
     if med.tymed == _TYMED_ISTREAM:
@@ -306,7 +353,8 @@ class RecvResult:
 
 
 def recv_file(index: int, out_path: str | Path, *, chunk: int = 65536,
-             formatetc_retries: int = 15, formatetc_retry_wait: float = 0.1) -> RecvResult:
+             formatetc_retries: int = 15, formatetc_retry_wait: float = 0.1,
+             open_retries: int = 10, open_retry_wait: float = 0.1) -> RecvResult:
     """FileContents(index) -> IStream, читаем чанками в out_path.
 
     samples — (perf_counter, len(чанка)) на каждое успешное Read; тем же
@@ -323,9 +371,7 @@ def recv_file(index: int, out_path: str | Path, *, chunk: int = 65536,
     появления файла в буфере не прочитать.
     """
     cf_contents = user32.RegisterClipboardFormatW("FileContents")
-    ppdo = ctypes.c_void_p()
-    hr = ole32.OleGetClipboard(ctypes.byref(ppdo))
-    _check(hr, "OleGetClipboard")
+    ppdo = _ole_get_clipboard(open_retries=open_retries, open_retry_wait=open_retry_wait)
     started = time.perf_counter()
     med = None
     last_err: ClipboardFileError | None = None
@@ -406,8 +452,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="rdpconn.fileclip")
     sub = parser.add_subparsers(dest="mode", required=True)
 
-    p_send = sub.add_parser("send", help="положить файл в буфер")
-    p_send.add_argument("path")
+    p_send = sub.add_parser("send", help="положить файл(ы) в буфер")
+    p_send.add_argument("paths", nargs="+")
 
     p_list = sub.add_parser("list", help="показать файлы, сейчас лежащие в буфере")
 
@@ -416,6 +462,8 @@ def main(argv: list[str] | None = None) -> int:
     p_recv.add_argument("--chunk", type=int, default=65536)
     p_recv.add_argument("--formatetc-retries", type=int, default=15)
     p_recv.add_argument("--formatetc-retry-wait", type=float, default=0.1)
+    p_recv.add_argument("--open-retries", type=int, default=10)
+    p_recv.add_argument("--open-retry-wait", type=float, default=0.1)
 
     p_watch = sub.add_parser("watch", help="ждать новый файл и забрать его")
     p_watch.add_argument("out_dir")
@@ -424,11 +472,13 @@ def main(argv: list[str] | None = None) -> int:
     p_watch.add_argument("--poll-interval", type=float, default=0.05)
     p_watch.add_argument("--formatetc-retries", type=int, default=15)
     p_watch.add_argument("--formatetc-retry-wait", type=float, default=0.1)
+    p_watch.add_argument("--open-retries", type=int, default=10)
+    p_watch.add_argument("--open-retry-wait", type=float, default=0.1)
 
     args = parser.parse_args(argv)
     if args.mode == "send":
-        send_file(args.path)
-        app.say(f"положил в буфер: {args.path}")
+        send_files(args.paths)
+        app.say(f"положил в буфер ({len(args.paths)}): {', '.join(args.paths)}")
     elif args.mode == "list":
         for e in list_clipboard_files():
             app.say(f"{e.name}: {e.size} байт")
@@ -436,13 +486,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "watch":
             wait_for_new_file(sequence_number(), poll_interval=args.poll_interval,
                               timeout=args.timeout)
-        entries = list_clipboard_files()
+        entries = list_clipboard_files(open_retries=args.open_retries,
+                                       open_retry_wait=args.open_retry_wait)
         os.makedirs(args.out_dir, exist_ok=True)
         for i, e in enumerate(entries):
             out_path = os.path.join(args.out_dir, e.name)
             result = recv_file(i, out_path, chunk=args.chunk,
                               formatetc_retries=args.formatetc_retries,
-                              formatetc_retry_wait=args.formatetc_retry_wait)
+                              formatetc_retry_wait=args.formatetc_retry_wait,
+                              open_retries=args.open_retries,
+                              open_retry_wait=args.open_retry_wait)
             rate = result.bytes_total / result.total_s if result.total_s > 0 else 0.0
             app.say(f"[{i}] {e.name}: {result.bytes_total} байт за {result.total_s:.3f} с "
                    f"(первый байт {result.first_byte_s:.3f} с, {rate:.0f} Б/с)")
