@@ -124,6 +124,11 @@ class Link:
         self.seq = app.SeqCounter()
         self._mid = 1
         self._queue = 0
+        # Вызывается из read_request() только в простое (нет своего запроса в
+        # сборке) и только когда кадр не наш (C1) — точка входа для чужого
+        # протокола в том же слоте (F1, DropWatcher из ends.py). None — никто
+        # не подписался, поведение не отличается от версии без этого крючка.
+        self.on_tick = None
 
     def _next_mid(self) -> int:
         mid = self._mid
@@ -229,7 +234,7 @@ class Link:
         # Ошибка — один кадр. Длинный текст режется: иначе середина уехала бы как кусок ответа.
         self._write(text.encode("utf-8", "replace")[:CHUNK], OP_ERR, 0)
 
-    def _read_window(self, timeout: float | None):
+    def _read_window(self, timeout: float | None, on_tick=None):
         deadline = None if timeout is None else time.monotonic() + timeout
         parts: dict[int, bytes] = {}
         ended = False
@@ -243,13 +248,22 @@ class Link:
                     raise CoderError("окно текста не доехало")
             raw = self.transport.receive(left)
             if raw is None:
+                # not parts: окно ещё не начато — простой, а не пауза внутри
+                # уже идущей сборки. Там дёргать чужой протокол рано: кадр
+                # может быть продолжением уже начатого куска, просто опоздал.
+                if on_tick is not None and not parts:
+                    on_tick(None)
                 if deadline is None:
                     continue
                 raise CoderError("окно текста не доехало")
             if timeout is not None:
                 deadline = time.monotonic() + timeout
             parsed = _note(raw)
-            if parsed is None or parsed[0] == OP_ACK:
+            if parsed is None:
+                if on_tick is not None and not parts:
+                    on_tick(raw)
+                continue
+            if parsed[0] == OP_ACK:
                 continue
             op, flags, mid, part, body = parsed
             parts[part] = body
@@ -283,7 +297,10 @@ class Link:
         flags = 0
         while True:
             try:
-                op, flags, mid, body = self._read_window(self.reply_wait if chunks else None)
+                op, flags, mid, body = self._read_window(
+                    self.reply_wait if chunks else None,
+                    on_tick=self.on_tick if not chunks else None,
+                )
             except CoderError:
                 if chunks:
                     raise
@@ -547,7 +564,7 @@ def watch_parent() -> None:
     threading.Thread(target=run, name="rdpconn-parent", daemon=True).start()
 
 
-def guest_loop(link: Link, once_path: str | None) -> int:
+def guest_loop(link: Link, once_path: str | None, *, file_lock=None) -> int:
     from .statcell import ERR_CODER, ERR_JSON, FEED_MODEL, attach_guest
 
     board = attach_guest(link.transport, FEED_MODEL)
@@ -576,8 +593,20 @@ def guest_loop(link: Link, once_path: str | None) -> int:
             sys.stdout.write(json.dumps({"error": str(exc)}, ensure_ascii=False) + "\n")
             sys.stdout.flush()
 
+    # file_lock синхронизирует с DropWatcher (ends.py): пока гость разбирает
+    # запрос, фоновый опрос папки не должен тянуть из того же транспорта кадр,
+    # предназначенный коду тут. Idle-время стоящего на вводе `for line in
+    # sys.stdin` сама по себе ничем не защищена — лочить нечего, пока run()
+    # не начался.
+    def run_locked(obj: dict) -> None:
+        if file_lock is None:
+            run(obj)
+            return
+        with file_lock:
+            run(obj)
+
     if once_path:
-        run(json.loads(Path(once_path).read_text(encoding="utf-8")))
+        run_locked(json.loads(Path(once_path).read_text(encoding="utf-8")))
         return 0
     for line in sys.stdin:
         line = line.strip()
@@ -590,7 +619,7 @@ def guest_loop(link: Link, once_path: str | None) -> int:
             sys.stdout.write(json.dumps({"error": f"не json: {exc}"}, ensure_ascii=False) + "\n")
             sys.stdout.flush()
             continue
-        run(obj)
+        run_locked(obj)
     return 0
 
 

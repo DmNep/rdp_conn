@@ -230,7 +230,8 @@ class Handshake:
 
 def send_files(transport, paths: list[str | Path], *, chunk: int = 524288,
                ready_timeout: float = 20.0,
-               result_timeout: float | None = None) -> list[tuple[str, int, str]]:
+               result_timeout: float | None = None,
+               pause: bool = False) -> list[tuple[str, int, str]]:
     """Полный цикл отправителя: offer -> ready -> send_files() -> done.
 
     result_timeout по умолчанию — оценка времени передачи (Offer.estimate_s)
@@ -239,6 +240,13 @@ def send_files(transport, paths: list[str | Path], *, chunk: int = 524288,
     (list_clipboard_files — до 30×0.15 с, recv_file — до 15×0.1 с, плюс лаг
     редиректа туда и обратно) — живьём эта сумма спокойно съедала прежний
     запас в 15 с, хотя сама передача укладывалась в секунды.
+
+    pause=True — поставить ClipboardTransport.pause() вокруг fileclip.send_files(),
+    и только вокруг него: offer()/wait_result() сами пишут в тот же транспорт,
+    поставить их под паузу значило бы, что собственный FILE_OFFER/приём
+    FILE_DONE дожидается самого себя. Нужно только там, где транспорт делят с
+    чужим фоновым писателем в этом же процессе (DropWatcher в ends.py);
+    самостоятельный `python -m rdpconn.fileshake send` им не делится ни с кем.
     """
     hs = Handshake(transport)
     offer = hs.offer(paths, chunk=chunk, ready_timeout=ready_timeout)
@@ -253,41 +261,142 @@ def send_files(transport, paths: list[str | Path], *, chunk: int = 524288,
     # свою квоту. Небольшая пауза здесь — не замена тем retry (они остаются),
     # а снижение частоты, с которой их квота вообще нужна.
     time.sleep(0.5)
-    fileclip.send_files(paths)
+    if pause:
+        transport.pause()
+    try:
+        fileclip.send_files(paths)
+    finally:
+        if pause:
+            transport.resume()
     return hs.wait_result(result_timeout)
 
 
 def recv_files(transport, out_dir: str | Path, *, offer_timeout: float | None = None,
               chunk_override: int | None = None,
-              file_timeout_margin: float = 30.0) -> list[tuple[str, int, str]] | None:
+              file_timeout_margin: float = 30.0,
+              pause: bool = False) -> list[tuple[str, int, str]] | None:
     """Полный цикл получателя: ждать offer -> ready -> recv -> done/fail.
 
     None — offer_timeout истёк, никто ничего не предлагал (не ошибка, а
     пустой результат: вызывающий решает, повторить ожидание или нет).
+    pause — см. send_files(), тот же смысл для приёмной стороны.
     """
     hs = Handshake(transport)
     offer = hs.wait_offer(offer_timeout)
     if offer is None:
         return None
     hs.accept()
+    return _receive_body(hs, transport, offer, out_dir, chunk_override=chunk_override,
+                         file_timeout_margin=file_timeout_margin, pause=pause)
+
+
+def _receive_body(hs: Handshake, transport, offer: Offer, out_dir: str | Path, *,
+                  chunk_override: int | None = None, file_timeout_margin: float = 30.0,
+                  pause: bool = False) -> list[tuple[str, int, str]]:
+    """Общий хвост recv_files() после accept(): скачать, посчитать sha256, отчитаться.
+
+    Вынесено отдельно, чтобы DropWatcher мог войти сюда уже имея решённый
+    offer (из кадра, перехваченного на чужом цикле получения) — заново гонять
+    wait_offer()/accept() там не на чём, кадр уже прочитан.
+    """
     chunk = chunk_override or offer.chunk
     seq_before = fileclip.sequence_number()
     out_dir = str(out_dir)
     try:
-        fileclip.wait_for_new_file(seq_before, timeout=offer.estimate_s * 3 + file_timeout_margin)
-        entries = fileclip.list_clipboard_files(formatetc_retries=30, formatetc_retry_wait=0.15)
-        os.makedirs(out_dir, exist_ok=True)
-        results: list[tuple[str, int, str]] = []
-        for i, entry in enumerate(entries):
-            out_path = os.path.join(out_dir, entry.name)
-            recv = fileclip.recv_file(i, out_path, chunk=chunk)
-            digest = hashlib.sha256(Path(out_path).read_bytes()).hexdigest()
-            results.append((entry.name, recv.bytes_total, digest))
-        hs.report_done(results)
-        return results
+        if pause:
+            transport.pause()
+        try:
+            fileclip.wait_for_new_file(seq_before, timeout=offer.estimate_s * 3 + file_timeout_margin)
+            entries = fileclip.list_clipboard_files(formatetc_retries=30, formatetc_retry_wait=0.15)
+            os.makedirs(out_dir, exist_ok=True)
+            results: list[tuple[str, int, str]] = []
+            for i, entry in enumerate(entries):
+                out_path = os.path.join(out_dir, entry.name)
+                recv = fileclip.recv_file(i, out_path, chunk=chunk)
+                digest = hashlib.sha256(Path(out_path).read_bytes()).hexdigest()
+                results.append((entry.name, recv.bytes_total, digest))
+        finally:
+            if pause:
+                transport.resume()
     except Exception as exc:
         hs.report_fail(str(exc))
         raise
+    hs.report_done(results)
+    return results
+
+
+class DropWatcher:
+    """F1 поверх занятого транспорта: обслуживает папку, пока host/guest
+    (ends.py) заняты обычным текстовым обменом.
+
+    Второй процесс рядом с host/guest делить тот же слот не может (см. правило
+    «один читатель на сторону», AGENTS.md 3) — значит, файловый обмен обязан
+    жить в том же процессе, тем же транспортом. tick() — единственная точка
+    входа: вызывающий код сам решает, когда момент простоя достаточно безопасен
+    (не середина разбора запроса/ответа), и передаёт сюда либо чужой кадр, на
+    который не отозвался его собственный протокол (raw), либо None — опрос по
+    расписанию без нового кадра. Ничего из tick() не просачивается наружу как
+    исключение: одна неудачная файловая передача не должна валить канал модели/сети.
+    """
+
+    def __init__(self, transport, drop_dir: str | Path, *, chunk: int = 524288,
+                outbox_retry_s: float = 60.0) -> None:
+        self.transport = transport
+        drop = Path(drop_dir)
+        self.inbox = drop / "in"
+        self.outbox = drop / "out"
+        self.sent = self.outbox / "sent"
+        self.chunk = chunk
+        self.outbox_retry_s = outbox_retry_s
+        self._outbox_fail_until = 0.0
+
+    def tick(self, raw: bytes | None) -> None:
+        try:
+            if raw is not None:
+                self._handle_incoming(raw)
+            self._check_outbox()
+        except Exception as exc:
+            app.warn(f"!! fileshake (drop): {exc}")
+
+    def _handle_incoming(self, raw: bytes) -> None:
+        parsed = _note(raw)
+        if parsed is None or parsed[0] != OP_OFFER:
+            return
+        obj = json.loads(parsed[1].decode("utf-8"))
+        offer = Offer(files=[tuple(e) for e in obj["f"]], chunk=obj["c"], estimate_s=obj["e"])
+        hs = Handshake(self.transport)
+        hs.accept()
+        self.inbox.mkdir(parents=True, exist_ok=True)
+        try:
+            results = _receive_body(hs, self.transport, offer, str(self.inbox), pause=True)
+        except Exception as exc:
+            app.warn(f"!! приём файла (drop) не удался: {exc}")
+            return
+        for name, n, digest in results:
+            app.say(f".. принят файл (drop): {name} {n} байт sha256={digest}")
+
+    def _check_outbox(self) -> None:
+        if time.monotonic() < self._outbox_fail_until:
+            return
+        try:
+            paths = sorted(p for p in self.outbox.iterdir() if p.is_file())
+        except FileNotFoundError:
+            return
+        if not paths:
+            return
+        try:
+            results = send_files(self.transport, paths, chunk=self.chunk, pause=True)
+        except HandshakeError as exc:
+            # Без отступа повтор каждые несколько секунд долбил бы собеседника
+            # тем же отказом (занят, таймаут) до бесконечности.
+            self._outbox_fail_until = time.monotonic() + self.outbox_retry_s
+            app.warn(f"!! отправка файла (drop) не удалась: {exc}")
+            return
+        self.sent.mkdir(parents=True, exist_ok=True)
+        for path in paths:
+            path.replace(self.sent / path.name)
+        for name, n, digest in results:
+            app.say(f".. файл отправлен (drop): {name} {n} байт sha256={digest}")
 
 
 def build_parser() -> argparse.ArgumentParser:

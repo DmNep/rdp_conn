@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 
-from . import app, coder, gate, monitor
+from . import app, coder, fileshake, gate, monitor
 from .statcell import FEED_MODEL, FEED_NET, PAGE, Picture, attach_guest
 
 _LOOPBACK = {"127.0.0.1", "localhost", "::1"}
@@ -39,6 +40,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="гуест, интернет: локальный прокси (только 127.0.0.1)")
     p.add_argument("--monitor", default=None,
                    help="хост: страница, по умолчанию 127.0.0.1:8078. Пусто — не поднимать")
+    p.add_argument("--drop", default="",
+                   help="папка файлового канала F1: DROP/out/* уходит собеседнику, "
+                        "входящие ложатся в DROP/in/. Пусто — выключено "
+                        "(только feed=model: у gate.py нет точки простоя для проверки)")
     return p
 
 
@@ -57,6 +62,9 @@ def main(role: str, argv=None) -> int:
     if role == "guest" and args.monitor:
         app.warn("страница только на хосте, на гуесте её не поднимаю")
         args.monitor = ""
+    if args.drop and args.feed == "net":
+        app.warn("папка (--drop) пока только для feed=model, игнорирую")
+        args.drop = ""
     if role == "guest" and not coder.claim_guest():
         app.warn("кодер уже в сессии")
         return 0
@@ -105,15 +113,55 @@ def _model(role: str, args, channel, talk) -> int:
         wait = 12
         talk(".. жду снимок до 12 с")
     link = coder.Link(channel.transport, cells=max(1, args.cells), reply_wait=wait)
+    watcher = fileshake.DropWatcher(channel.transport, args.drop) if args.drop else None
+    if watcher is not None:
+        talk(f".. файловая папка: {args.drop}")
     if role == "host":
         app.say(f"хост, модель {args.upstream}")
+        if watcher is not None:
+            # Простой между запросами — единственная точка, где read_request()
+            # зовёт on_tick (coder.py, только пока chunks пуст): фоновый
+            # beat-поток уже остановлен к этому моменту, писать в транспорт
+            # кроме нас тут некому.
+            link.on_tick = watcher.tick
 
         def complete(messages):
             yield from coder.iter_llama(args.upstream, args.model, messages, timeout=max(wait, 30))
 
         coder.serve(link, complete)
         return 0
-    return coder.guest_loop(link, args.once or None)
+    if watcher is None:
+        return coder.guest_loop(link, args.once or None)
+    return _guest_with_drop(link, args.once or None, watcher)
+
+
+def _guest_with_drop(link, once_path, watcher) -> int:
+    """Гость: idle-время — блокирующее чтение stdin, транспорт тогда никто не
+    трогает вовсе. Фоновый поток — единственный способ туда заглянуть; lock не
+    даёт ему вмешаться, пока guest_loop() сам разбирает активный запрос."""
+    lock = threading.Lock()
+    stop = threading.Event()
+
+    def poll() -> None:
+        while not stop.is_set():
+            # tick() сам пишет в транспорт (FILE_READY, сама передача) —
+            # лочить только receive() мало, иначе run_locked() в guest_loop()
+            # может начать запрос прямо посреди уже идущей файловой передачи.
+            if lock.acquire(blocking=False):
+                try:
+                    raw = link.transport.receive(0.2)
+                    watcher.tick(raw)
+                finally:
+                    lock.release()
+                if raw is not None:
+                    continue
+            stop.wait(3.0)
+
+    threading.Thread(target=poll, name="rdpconn-drop", daemon=True).start()
+    try:
+        return coder.guest_loop(link, once_path, file_lock=lock)
+    finally:
+        stop.set()
 
 
 def _net(role: str, args, channel, talk) -> int:
@@ -122,7 +170,7 @@ def _net(role: str, args, channel, talk) -> int:
     if store is not None and store.__class__.__name__ == "WindowsClipboard" and wait < 8:
         wait = 8
         talk(".. жду ответ шлюза до 8 с")
-    stop = __import__("threading").Event()
+    stop = threading.Event()
     if role == "host":
         app.say("хост, интернет: выход отсюда, в сессию его не раздаю")
         gate.dial_loop(channel.transport, stop, wait, None)
