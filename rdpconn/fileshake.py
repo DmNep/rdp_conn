@@ -241,12 +241,22 @@ def send_files(transport, paths: list[str | Path], *, chunk: int = 524288,
     редиректа туда и обратно) — живьём эта сумма спокойно съедала прежний
     запас в 15 с, хотя сама передача укладывалась в секунды.
 
-    pause=True — поставить ClipboardTransport.pause() вокруг fileclip.send_files(),
-    и только вокруг него: offer()/wait_result() сами пишут в тот же транспорт,
-    поставить их под паузу значило бы, что собственный FILE_OFFER/приём
-    FILE_DONE дожидается самого себя. Нужно только там, где транспорт делят с
-    чужим фоновым писателем в этом же процессе (DropWatcher в ends.py);
-    самостоятельный `python -m rdpconn.fileshake send` им не делится ни с кем.
+    pause=True — поставить ClipboardTransport.pause() вокруг fileclip.send_files()
+    и wait_result(): offer() пишет в тот же транспорт (FILE_OFFER) и поэтому
+    остаётся снаружи паузы — поставить его под паузу значило бы, что
+    собственный FILE_OFFER дожидается самого себя. wait_result() же только
+    читает (receive()), пауза ему не мешает — но держать её, пока не придёт
+    FILE_DONE/FAIL, важно: resume() (ClipboardTransport._reconcile()) сам
+    читает буфер классическим GetClipboardData(CF_UNICODETEXT), и если
+    сделать это сразу после OleSetClipboard, не дождавшись, что собеседник
+    (возможно, ещё за RDP-редиректом) дочитал FileContents, этот лишний
+    классический GetClipboardData способен сорвать ещё не отданный
+    delay-render — живьём (27.11.2026) ловилось GetData(cf=49272, FileContents)
+    на стороне получателя, HRESULT 0x80040064, именно при resume() сразу после
+    send_files(), а не при resume() после wait_result(). Нужно только там,
+    где транспорт делят с чужим фоновым писателем в этом же процессе
+    (DropWatcher в ends.py); самостоятельный `python -m rdpconn.fileshake send`
+    им не делится ни с кем.
     """
     hs = Handshake(transport)
     offer = hs.offer(paths, chunk=chunk, ready_timeout=ready_timeout)
@@ -265,10 +275,10 @@ def send_files(transport, paths: list[str | Path], *, chunk: int = 524288,
         transport.pause()
     try:
         fileclip.send_files(paths)
+        return hs.wait_result(result_timeout)
     finally:
         if pause:
             transport.resume()
-    return hs.wait_result(result_timeout)
 
 
 def recv_files(transport, out_dir: str | Path, *, offer_timeout: float | None = None,
