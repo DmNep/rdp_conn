@@ -352,7 +352,7 @@ class RecvResult:
     samples: list[tuple[float, int]] = field(default_factory=list)
 
 
-def recv_file(index: int, out_path: str | Path, *, chunk: int = 65536,
+def recv_file(index: int, out_path: str | Path, *, chunk: int = 524288,
              formatetc_retries: int = 15, formatetc_retry_wait: float = 0.1,
              open_retries: int = 10, open_retry_wait: float = 0.1) -> RecvResult:
     """FileContents(index) -> IStream, читаем чанками в out_path.
@@ -459,7 +459,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_recv = sub.add_parser("recv", help="забрать файл(ы) из буфера в папку")
     p_recv.add_argument("out_dir")
-    p_recv.add_argument("--chunk", type=int, default=65536)
+    p_recv.add_argument("--chunk", type=int, default=524288)
     p_recv.add_argument("--formatetc-retries", type=int, default=15)
     p_recv.add_argument("--formatetc-retry-wait", type=float, default=0.1)
     p_recv.add_argument("--open-retries", type=int, default=10)
@@ -467,7 +467,7 @@ def main(argv: list[str] | None = None) -> int:
 
     p_watch = sub.add_parser("watch", help="ждать новый файл и забрать его")
     p_watch.add_argument("out_dir")
-    p_watch.add_argument("--chunk", type=int, default=65536)
+    p_watch.add_argument("--chunk", type=int, default=524288)
     p_watch.add_argument("--timeout", type=float, default=120.0)
     p_watch.add_argument("--poll-interval", type=float, default=0.05)
     p_watch.add_argument("--formatetc-retries", type=int, default=15)

@@ -118,8 +118,9 @@ def main() -> int:
                         help="куда send пишет сгенерированный файл")
     parser.add_argument("--out-dir", default="bench_file_recv",
                         help="куда recv сохраняет принятый файл")
-    parser.add_argument("--chunk", type=int, default=65536,
-                        help="размер одного IStream::Read на recv (по умолчанию 64 КБ)")
+    parser.add_argument("--chunk", type=int, default=524288,
+                        help="размер одного IStream::Read на recv (по умолчанию 512 КБ — "
+                             "плато пропускной способности, см. память проекта)")
     parser.add_argument("--poll-interval", type=float, default=0.05,
                         help="как часто recv проверяет смену буфера, в секундах")
     parser.add_argument("--timeout", type=float, default=120.0,
