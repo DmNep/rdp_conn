@@ -213,6 +213,18 @@ def fetch_through_gate(proxy: int, origin: int, expect_len: int) -> bytes:
 
 
 def main() -> int:
+    print("=== 0. BULK_THRESHOLD строго ниже _WINDOW (реальные дефолты, без подмен) ===")
+    # Регресс к 28.11.2026: с BULK_THRESHOLD=128КБ, _WINDOW=64КБ to_peer не
+    # растёт выше ~_WINDOW+8192, и кандидат в _bulk_round() никогда не
+    # набирался -- файловый режим был недостижим при любом объёме тела
+    # ответа. Найдено живым прогоном G6, не домыслено (память
+    # gate_bulk_window_threshold_bug.md). gate.py теперь падает assert'ом
+    # при импорте на то же самое -- этот сценарий проверяет ту же
+    # инвариант явным тестом, не полагаясь только на побочный эффект assert.
+    check("BULK_THRESHOLD < _WINDOW на реальных константах модуля",
+          gate.BULK_THRESHOLD < gate._WINDOW,
+          f"BULK_THRESHOLD={gate.BULK_THRESHOLD} _WINDOW={gate._WINDOW}")
+
     print("=== 1. ниже порога -- обычные ячейки, fileclip не вызывается ===")
     fake = FakeFileClip()
     saved = patch_fileclip(fake)
