@@ -81,6 +81,37 @@ hb.mark_lost()
 hb._last_ping = time.monotonic() - 100.0
 check("приёмник своих PING не шлёт и после обрыва", not hb.due())
 
+print("=== 6. heartbeat_check(): видит заниженный app.CHRONIC_STALL_S ===")
+# Порог в chronic() передаётся явно, не через умолчание сигнатуры -- иначе
+# правка app.CHRONIC_STALL_S после импорта модуля (как здесь) осталась бы
+# невидимой: умолчание связывается один раз при определении класса.
+old_threshold = app.CHRONIC_STALL_S
+app.CHRONIC_STALL_S = 0.0
+try:
+    hb = app.Heartbeat(interval=1.0, misses=1)
+    hb._last_seen = time.monotonic() - 10.0
+    app.heartbeat_check(hb, transport=None)
+    check("expired() объявил обрыв на этом же вызове", not hb.alive)
+    fired = hb.chronic(app.CHRONIC_STALL_S)
+    check("chronic() с заниженным порогом тоже видит (используется явный порог)", fired)
+finally:
+    app.CHRONIC_STALL_S = old_threshold
+
+print("=== 7. chronic(): предупреждение про деградацию сессии, один раз на эпизод ===")
+hb = app.Heartbeat(interval=1.0, misses=3)
+check("живой собеседник — chronic() всегда False", not hb.chronic(threshold=0.0))
+hb.mark_lost()
+check("сразу после mark_lost — ещё рано (порог не прошёл)",
+     not hb.chronic(threshold=100.0))
+check("с порогом 0 — сработало", hb.chronic(threshold=0.0))
+check("второй вызов подряд — уже не повторяет (один раз на эпизод)",
+     not hb.chronic(threshold=0.0))
+revived = hb.note()
+check("note() сбросил счётчик эпизода", revived)
+hb.mark_lost()
+check("новый эпизод обрыва — предупреждение может сработать снова",
+     hb.chronic(threshold=0.0))
+
 print()
 print("RESULT: ALL GREEN" if not _failed else f"RESULT: FAIL ({_failed})")
 sys.exit(1 if _failed else 0)

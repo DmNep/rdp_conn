@@ -58,19 +58,30 @@ def add_channel_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--log-time", action="store_true",
                    help="метка времени перед каждой строкой вывода "
                         "(для разбора захваченного лога живого прогона позже)")
+    p.add_argument("--replace", action="store_true",
+                   help="вытеснить прежнюю копию этой роли на этой машине "
+                        "(singleton.py); без флага конфликт — отказ запуска, "
+                        "не тихое вытеснение")
+    p.add_argument("--no-startup-check", dest="startup_check", action="store_false",
+                   help="не проверять штатный канал (интернет/\\\\tsclient) при "
+                        "старте — проверка только информирует, не переключает "
+                        "канал, но стоит до ~1 с (diag.py)")
 
 
 class Channel:
     """Канал: транспорт плюс то немногое, что у него спрашивают tx/rx."""
 
-    def __init__(self, transport) -> None:
+    def __init__(self, transport, lock=None) -> None:
         self.transport = transport
         self.label = transport.describe
+        self._lock = lock
 
     def close(self) -> None:
         closer = getattr(self.transport, "close", None)
         if closer is not None:
             closer()
+        if self._lock is not None:
+            self._lock.close()
 
 
 def _pause_reporter(hotkey, pause_timeout):
@@ -104,11 +115,40 @@ def _pause_reporter(hotkey, pause_timeout):
     return report
 
 
-def open_channel(args: argparse.Namespace) -> Channel:
-    """Собрать канал по аргументам."""
+def _report_startup_hint(diag) -> None:
+    hint = diag.startup_hint()
+    if hint:
+        say(hint)
+
+
+def open_channel(args: argparse.Namespace, role: str | None = None) -> Channel:
+    """Собрать канал по аргументам.
+
+    role, когда задан, — это защита от второй копии той же роли на этой
+    машине (singleton.py): два процесса, пишущих в одну историю ячеек под
+    одним peer_id, дают не ошибку, а лавину подтверждений на каждый кадр
+    (AGENTS.md 3) — найти такое по логам намного дороже, чем отказать в
+    запуске сразу. role=None — для ролей, что уже защищены иначе (coder
+    guest — своей кооперативной пересдачей, claim_guest()) или вообще не
+    пишут в слот (monitor).
+    """
     from .clipboard import ClipboardError, ClipboardTransport, open_store
+    from . import diag, singleton
 
     set_timestamps(getattr(args, "log_time", False))
+    if getattr(args, "startup_check", True):
+        # Фоном, не перед открытием транспорта: подсказка не должна стоить
+        # ни одной миллисекунды самому каналу. Раньше была синхронной и
+        # ровно этим доказанно сломала тайминг test_duplex.py (сценарий 7,
+        # сегментированная команда с --wait 5) — там и без того впритык.
+        threading.Thread(target=_report_startup_hint, args=(diag,), daemon=True).start()
+    lock = None
+    if role is not None:
+        try:
+            lock = singleton.acquire(role, args.peer_id,
+                                      replace=getattr(args, "replace", False))
+        except singleton.SingletonError as exc:
+            raise UsageError(str(exc)) from None
     try:
         store = open_store(args.slot)
         transport = ClipboardTransport(
@@ -118,8 +158,10 @@ def open_channel(args: argparse.Namespace) -> Channel:
             on_pause=_pause_reporter(args.hotkey, args.pause_timeout),
         )
     except ClipboardError as exc:
+        if lock is not None:
+            lock.close()
         raise UsageError(str(exc)) from None
-    return Channel(transport)
+    return Channel(transport, lock=lock)
 
 
 def peer_hint(args: argparse.Namespace) -> None:
@@ -253,6 +295,14 @@ MIN_SILENCE_S = 30.0
 # потолка удвоение росло бы неограниченно, и возврат собеседника после долгого
 # простоя обнаружился бы только следующей командой человека, а не само.
 RECONNECT_BACKOFF_MAX_S = 300.0
+# Второй, более долгий порог поверх самого объявления обрыва: не «пауза
+# редиректа», а «ни одного признака жизни так долго, что это больше похоже
+# на деградацию самой RDP-сессии». Число не взято с потолка: 27.11.2026 на
+# живом стенде одно и то же направление (B→A) не отвечало вовсе по 4+ минуты,
+# дважды за один день на одном и том же давно открытом mstsc-сеансе (память
+# проекта roadmap_item5_gate_bulk_mode.md) — обычная пауза редиректа
+# (десятки секунд) этим не объясняется.
+CHRONIC_STALL_S = 180.0
 
 
 class Heartbeat:
@@ -300,6 +350,11 @@ class Heartbeat:
         # Текущая пауза между разведывательными PING, пока собеседник потерян;
         # 0, пока он жив — считать нечего, due() тогда смотрит на interval.
         self._dead_gap = 0.0
+        # Когда объявили обрыв (не когда видели последний кадр — resync()
+        # двигает _last_seen вперёд на каждой проверке, иначе chronic() ниже
+        # мерил бы не "сколько мы мертвы", а "сколько с последней проверки").
+        self._declared_dead_at: float | None = None
+        self._chronic_warned = False
 
     def note(self) -> bool:
         """Отметить признак жизни. True — собеседник считался потерянным.
@@ -315,6 +370,8 @@ class Heartbeat:
         self._last_ping = now
         self.alive = True
         self._dead_gap = 0.0
+        self._declared_dead_at = None
+        self._chronic_warned = False
         return revived
 
     def due(self) -> bool:
@@ -377,7 +434,23 @@ class Heartbeat:
         """Собеседник потерян: PING продолжаются, но реже (см. ping())."""
         self.alive = False
         self._dead_gap = self.interval
+        if self._declared_dead_at is None:
+            self._declared_dead_at = time.monotonic()
         self.resync()
+
+    def chronic(self, threshold: float = CHRONIC_STALL_S) -> bool:
+        """Не просто «потерян», а «потерян надолго без единого признака
+        жизни» — см. докстринг CHRONIC_STALL_S. True ровно один раз на
+        эпизод простоя (пока не вернётся собеседник или не начнётся новый
+        эпизод), не на каждый тик — иначе предупреждение сыпалось бы
+        постоянно, пока разведывательные PING идут всё реже и реже.
+        """
+        if self.alive or self._declared_dead_at is None or self._chronic_warned:
+            return False
+        if time.monotonic() - self._declared_dead_at < threshold:
+            return False
+        self._chronic_warned = True
+        return True
 
 
 def make_heartbeat(args: argparse.Namespace, proactive: bool = True) -> Heartbeat:
@@ -444,6 +517,15 @@ def heartbeat_tick(hb, transport) -> bool:
 
 def heartbeat_check(hb, transport) -> bool:
     """Проверить молчание собеседника. True — обрыв объявлен впервые."""
+    # Порог передаётся явно, а не берётся из умолчания chronic(): умолчание
+    # в сигнатуре метода связывается один раз при определении класса и не
+    # видит правку CHRONIC_STALL_S уже после импорта модуля (ровно то, на
+    # чём держится возможность занизить порог в тесте).
+    if hb.chronic(CHRONIC_STALL_S):
+        warn(f"!! канал молчит дольше {CHRONIC_STALL_S / 60:.0f} мин без единого "
+             f"признака жизни — не похоже на обычную паузу редиректа. Если mstsc "
+             f"открыт уже давно, попробуйте переподключить RDP-сессию, прежде чем "
+             f"разбираться дальше")
     if not hb.expired():
         return False
     warn(f"!! собеседник молчит {hb.silence():.1f} с — канал считается потерянным")

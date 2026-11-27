@@ -1,19 +1,33 @@
-"""Потолок снимка без буфера: ступени, потеря, вторая потеря, пауза."""
+"""Потолок снимка без буфера: ступени, потеря, вторая потеря, пауза.
+
+Ceiling() здесь без peer_id (как и было до кэша потолка, docs/roadmap.md
+пункт 4) — а значит, без изоляции он читал бы и писал бы общий файл
+%TEMP%\\rdpconn-ceiling\\no-peer-id.json: собственный прошлый прогон этого
+же скрипта («выше 58 не поднимается» поднимает потолок до 58 и сохраняет
+его) иначе ломал бы следующий запуск, стартуя не с 40, а с 58 — ровно так
+один раз и сломалось при живой проверке 27.11.2026. Подменяем каталог
+кэша на временный на время теста.
+"""
 
 from __future__ import annotations
 
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from rdpconn import gate  # noqa: E402
 from rdpconn.gate import (  # noqa: E402
     GATE_CELLS_MAX,
     GATE_CELLS_MIN,
     Ceiling,
     text_limit,
 )
+
+gate._CEILING_DIR = tempfile.mkdtemp(prefix="rdpconn_test_ceiling_cache_")
 
 
 class Pipe:
@@ -93,4 +107,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        code = main()
+    finally:
+        shutil.rmtree(gate._CEILING_DIR, ignore_errors=True)
+    sys.exit(code)

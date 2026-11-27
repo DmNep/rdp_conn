@@ -156,6 +156,15 @@ class WindowsClipboard:
     GMEM_MOVEABLE = 0x0002
     _OPEN_RETRIES = 12
     _OPEN_WAIT_S = 0.02
+    # SetClipboardData ловит gle=1418 (ERROR_CLIPBOARD_NOT_OPEN), даже когда
+    # OpenClipboard только что отдал успех: между этими двумя вызовами нет
+    # атомарности, и чужой процесс может перехватить буфер в этой щели —
+    # воспроизведено локально гонкой двух процессов (~0.22% попыток при
+    # тугом цикле, без каскада), память gle_1418_clipboard_race.md. Это не
+    # повторная проверка OpenClipboard (_open уже даёт 12 попыток входа),
+    # а отдельный, более короткий retry именно вокруг самой записи.
+    _SET_RETRIES = 5
+    _SET_WAIT_S = 0.02
 
     def __init__(self) -> None:
         self._user32 = ctypes.windll.user32  # требует Windows
@@ -245,17 +254,26 @@ class WindowsClipboard:
         ctypes.memmove(pointer, data, len(data))
         self._kernel32.GlobalUnlock(handle)
 
-        if not self._open():
-            self._kernel32.GlobalFree(handle)
-            raise ClipboardError("OpenClipboard не открылся: буфер занят другим приложением")
-        try:
-            self._user32.EmptyClipboard()
-            # После успешной SetClipboardData владеет блоком буфер обмена:
-            # GlobalFree здесь означал бы двойное освобождение.
-            if not self._user32.SetClipboardData(self.CF_UNICODETEXT, handle):
-                raise ClipboardError(f"SetClipboardData не удалось (gle={_gle()})")
-        finally:
-            self._user32.CloseClipboard()
+        last_gle = 0
+        for attempt in range(self._SET_RETRIES):
+            if not self._open():
+                self._kernel32.GlobalFree(handle)
+                raise ClipboardError("OpenClipboard не открылся: буфер занят другим приложением")
+            try:
+                self._user32.EmptyClipboard()
+                # После успешной SetClipboardData владеет блоком буфер обмена:
+                # GlobalFree здесь означал бы двойное освобождение.
+                if self._user32.SetClipboardData(self.CF_UNICODETEXT, handle):
+                    return
+                last_gle = _gle()
+            finally:
+                self._user32.CloseClipboard()
+            if attempt + 1 < self._SET_RETRIES:
+                time.sleep(self._SET_WAIT_S)
+        # Сюда доходим только если буфер так и не принял блок ни разу:
+        # владение им клипборд не получил, освобождать блок — наша забота.
+        self._kernel32.GlobalFree(handle)
+        raise ClipboardError(f"SetClipboardData не удалось (gle={last_gle})")
 
     def _open(self) -> bool:
         """Открыть с повторами: буфер держится тем, кто копирует, миллисекунды."""

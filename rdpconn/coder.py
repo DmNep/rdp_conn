@@ -14,20 +14,18 @@
 from __future__ import annotations
 
 import argparse
-import ctypes
 import hashlib
 import json
 import os
 import sys
 import threading
-from ctypes import wintypes
 import time
 import urllib.error
 import urllib.request
 import zlib
 from pathlib import Path
 
-from . import app, config, framing
+from . import app, config, framing, singleton
 from .gate import GATE_CELLS_MIN
 
 MAGIC = b"C1"
@@ -497,71 +495,13 @@ def _emit(kind: str, text: str) -> None:
     sys.stdout.flush()
 
 
-def claim_guest() -> bool:
-    """В сессии один писатель буфера. Второй ждёт, пока предыдущий процесс отпустит слот."""
-    if sys.platform != "win32":
-        return True
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.CreateMutexW.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
-    kernel32.CreateMutexW.restype = wintypes.HANDLE
-    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-    kernel32.CloseHandle.restype = wintypes.BOOL
-    for _ in range(20):
-        ctypes.set_last_error(0)
-        handle = kernel32.CreateMutexW(None, False, "Local\\rdpconn-guest")
-        if not handle:
-            return True
-        # 183 — мьютекс ещё у живого процесса. 128 — хозяин умер, мьютекс наш.
-        if ctypes.get_last_error() not in (183,):
-            global _GUEST_MUTEX
-            _GUEST_MUTEX = handle
-            return True
-        kernel32.CloseHandle(handle)
-        time.sleep(0.25)
-    return False
-
-
-_GUEST_MUTEX = None
-
-
-def watch_parent() -> None:
-    """Родитель Cline умер, а гость ещё ждёт кадр и держит слот. Тогда выходим."""
-    if sys.platform != "win32":
-        return
-
-    def run() -> None:
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-        ntdll = ctypes.WinDLL("ntdll")
-
-        class INFO(ctypes.Structure):
-            _fields_ = [
-                ("ExitStatus", ctypes.c_long),
-                ("PebBaseAddress", ctypes.c_void_p),
-                ("AffinityMask", ctypes.c_size_t),
-                ("BasePriority", ctypes.c_long),
-                ("UniqueProcessId", ctypes.c_void_p),
-                ("InheritedFromUniqueProcessId", ctypes.c_void_p),
-            ]
-
-        info = INFO()
-        status = ntdll.NtQueryInformationProcess(
-            kernel32.GetCurrentProcess(), 0, ctypes.byref(info), ctypes.sizeof(info), None
-        )
-        if status != 0:
-            return
-        parent = ctypes.cast(info.InheritedFromUniqueProcessId, ctypes.c_void_p).value or 0
-        if parent <= 4:
-            return
-        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        handle = kernel32.OpenProcess(0x00100000, False, parent)
-        if not handle:
-            os._exit(0)
-        kernel32.WaitForSingleObject(handle, 0xFFFFFFFF)
-        os._exit(0)
-
-    threading.Thread(target=run, name="rdpconn-parent", daemon=True).start()
+# claim_guest()/watch_parent() переехали в singleton.py — это тот же самый
+# мьютекс "Local\rdpconn-guest" и тот же retry, обобщённые для tx/rx/gate/
+# coder-host/fileshake (singleton.acquire()). Имена оставлены здесь как
+# тонкие алиасы: ends.py и внешний код зовут coder.claim_guest()/
+# coder.watch_parent(), менять оба места незачем.
+claim_guest = singleton.claim_guest
+watch_parent = singleton.watch_parent
 
 
 def guest_loop(link: Link, once_path: str | None, *, file_lock=None) -> int:
@@ -648,8 +588,9 @@ def main(argv=None) -> int:
         return 0
     if args.mode == "guest":
         watch_parent()
+    role = "coder-host" if args.mode == "host" else None
     try:
-        channel = app.open_channel(args)
+        channel = app.open_channel(args, role=role)
     except app.UsageError as exc:
         app.warn(str(exc))
         return 2

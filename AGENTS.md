@@ -121,10 +121,12 @@ A: cd C:\Users\d.proskurnin\projects\rdp_conn
 | `rdpconn/framing.py` | сборка и разбор кадра, коды отказа, конструкторы кадров |
 | `rdpconn/segment.py` | команда длиннее `MAX_PAYLOAD` — кадры-кусочки `SEG1` (`docs/protocol.md` 4) |
 | `rdpconn/clipboard.py` | слот: маркер `RDP1`, история ячеек, занятость, пауза, горячая клавиша |
-| `rdpconn/app.py` | аргументы, обмен, `SeqCounter`, heartbeat, вывод, `trace()` (`RDPCONN_TRACE`, общий для `gate`/`coder`) |
-| `rdpconn/tune.py` | замер паузы повтора снимка, рабочий запас (`PACE_MARGIN`) |
+| `rdpconn/app.py` | аргументы, обмен, `SeqCounter`, heartbeat, вывод, `trace()` (`RDPCONN_TRACE`, общий для `gate`/`coder`), `open_channel()` — общая точка для singleton-блокировки и стартовой подсказки; `CHRONIC_STALL_S`/`Heartbeat.chronic()` — подсказка переподключить RDP при затяжном (3+ мин) простое, не просто обычная пауза редиректа |
+| `rdpconn/singleton.py` | защита от второй копии роли на этой машине: мьютекс по `(role, peer_id)`, `--replace`; `claim_guest()`/`watch_parent()` для coder guest переехали сюда |
+| `rdpconn/diag.py` | фоновая (не блокирующая открытие канала!) подсказка про штатный канал: интернет, `\\tsclient` |
+| `rdpconn/tune.py` | замер паузы повтора снимка, рабочий запас (`PACE_MARGIN`) — только для tx/rx: gate/coder не отвечают на PING, см. `docs/roadmap.md` 3-4 |
 | `rdpconn/tx.py` / `rdpconn/rx.py` | два конца канала команд |
-| `rdpconn/gate.py` | HTTP-прокси через буфер: `listen`/`dial`, магия `G1`, динамический потолок снимка |
+| `rdpconn/gate.py` | HTTP-прокси через буфер: `listen`/`dial`, магия `G1`, динамический потолок снимка; крупный кусок (`BULK_THRESHOLD`) уходит файлом через `fileclip`, не ячейками (`docs/roadmap.md` 5) |
 | `rdpconn/coder.py` | текст локальной модели через буфер: `host`/`guest`, магия `C1` |
 | `rdpconn/ends.py` | общий запуск `host`/`guest` с `--feed model\|net` поверх `coder`/`gate` |
 | `rdpconn/statcell.py` | служебная ячейка снимка гуеста для страницы статистики, магия `S1` |
@@ -132,6 +134,7 @@ A: cd C:\Users\d.proskurnin\projects\rdp_conn
 | `rdpconn/__main__.py` | `python -m rdpconn tx|rx|gate|coder|host|guest|monitor` |
 | `cline/rdpconnHandler.ts` | провайдер Cline: модель через `coder guest`, без http и порта |
 | `docs/protocol.md` | спецификация (`tx`/`rx`/`gate`; `coder`/`host`/`guest`/`monitor` — см. 1) |
+| `docs/roadmap.md` | нереализованные предложения поверх базового канала, по порядку реализации |
 | `tools/test_*.py` | проверки без второй машины |
 | `tools/bench_*.py`, `tools/*_probe.py` | замеры и пробы на живом редиректе (потолок, алфавит, диск) |
 | `tools/make_portable.py` | архив для машины без интернета |
@@ -159,6 +162,13 @@ python tools\test_sim_clipboard.py  # DelayedClipboard, --slot sim:DELAY[,JITTER
 python tools\test_tx_wait.py      # ACK ждём по heartbeat, не по отдельному таймеру
 python tools\test_reconnect.py    # после обрыва PING не глохнут, а идут реже
 python tools\test_gate_sim.py     # gate под инъецированной задержкой, бэкофф повтора
+python tools\test_fileshake.py    # рукопожатие F1: offer/ready/done/fail, nonce
+python tools\test_fileshake_drop.py  # DropWatcher: drop-папка поверх fileshake
+python tools\test_singleton.py    # мьютекс по (role, peer_id), --replace, настоящий второй процесс
+python tools\test_diag.py         # стартовая подсказка: интернет/\\tsclient, фон, не блокирует
+python tools\test_gate_ceiling_cache.py  # потолок ячеек переживает перезапуск процесса
+python tools\test_gate_bulk.py     # крупный кусок через fileclip вместо ячеек, откат при сбое
+python tools\test_gate_chronic_stall.py  # подсказка переподключить RDP при затяжном простое dial/listen
 ```
 
 Прогонять через PowerShell, как в этом разделе: `test_duplex.py` под
@@ -236,6 +246,19 @@ git-bash/MINGW даёт ложный `FAIL` на проверке `cmd /c set` �
   байт-в-байт.
 - **`tools/test_duplex.py`: `start()` обязан давать `stdin=subprocess.PIPE`**,
   иначе REPL получает EOF и тест начинает зависеть от терминала.
+- **Затяжной простой без единого кадра — не то же самое, что обычная пауза
+  редиректа, и раньше об этом не было сигнала вовсе.** 27.11.2026 на живом
+  стенде направление B→A не отвечало по 4+ минуты дважды за один день на
+  одном и том же давно открытом mstsc-сеансе (память проекта,
+  `roadmap_item5_gate_bulk_mode.md`) — `dial_loop` при этом молчал в логе
+  полностью, человек не видел вообще никакого сигнала, что происходит.
+  Добавлен второй, более долгий порог поверх уже существующих (`Heartbeat`
+  у tx/rx, бэкофф тишины у `gate`'s `listen_loop`) — `app.CHRONIC_STALL_S`
+  (3 мин) и `Heartbeat.chronic()`/аналог в `dial_loop`: по истечении этого
+  порога без единого кадра — явная подсказка переподключить RDP-сессию, не
+  просто "канал считается потерянным". Срабатывает один раз на эпизод
+  простоя, не на каждый тик. Регресс — `tools/test_reconnect.py` (сценарии
+  6-7), `tools/test_gate_chronic_stall.py`.
 
 ## 7. Соглашения
 

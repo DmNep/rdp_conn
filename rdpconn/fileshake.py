@@ -502,7 +502,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        channel = app.open_channel(args)
+        channel = app.open_channel(args, role=f"fileshake-{args.mode}")
     except app.UsageError as exc:
         app.warn(str(exc))
         return 2

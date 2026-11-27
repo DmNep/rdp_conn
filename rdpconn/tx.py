@@ -530,7 +530,7 @@ def main(argv=None) -> int:
         app.warn("нужна команда в аргументах или --repl")
         return 2
     try:
-        channel = app.open_channel(args)
+        channel = app.open_channel(args, role="tx")
     except app.UsageError as exc:
         app.warn(str(exc))
         return 2

@@ -13,13 +13,19 @@ from __future__ import annotations
 
 import argparse
 import errno
+import hashlib
+import json
+import os
 import select
+import shutil
 import socket
 import sys
+import tempfile
 import time
+from dataclasses import dataclass
 from urllib.parse import urlsplit
 
-from . import app, config, framing, monitor
+from . import app, clipboard, config, fileclip, framing, monitor
 
 MAGIC = b"G1"
 OP_OPEN = 1
@@ -36,9 +42,39 @@ OP_GO = 9
 # Короткий ход: в снимке только подтверждения. Занятая сторона пишет следом ещё раз.
 # Больше одного пропуска подряд не бывает, иначе обратный запрос застревает.
 OP_YIELD = 10
+# Крупный кусок уходит файлом, не ячейками (docs/roadmap.md, пункт 5) — см.
+# "bulk"-блок ниже. OFFER несёт (offset, length, sha256) в body, не в стандартных
+# полях offset/payload кадра: это анонс, а не сами данные, формат кадра не
+# меняется. ABORT откатывает получателя или отправителя обратно на ячейки, не
+# дожидаясь полного таймаута другой стороны.
+OP_BULK_OFFER = 11
+OP_BULK_ABORT = 12
 _HEAD = 9  # magic + op + id + offset
 DATA_MAX = config.MAX_PAYLOAD - _HEAD
 MAX_STREAMS = 2
+# Выше этого — крупный кусок выгоднее слать файлом (fileclip), не ячейками:
+# измерено на живом стенде 27.11.2026 (память project_koda_over_channel.md) —
+# текст на пике 13–26 КБ/с, fileclip устойчиво 5–6 МБ/с, но фиксированная
+# цена одного файлового переноса (COM: OleSetClipboard/Flush/GetClipboard,
+# ретраи на CLIPBRD_E_CANT_OPEN/DV_E_FORMATETC) — от ~20 мс до нескольких
+# секунд на один перенос. Ниже порога эта цена не окупается мелким объёмом
+# (802 байта сегодня шли эффективных ~34 КБ/с — не быстрее пика текста).
+BULK_THRESHOLD = 128 * 1024
+# Не передавать больше этого одним файлом: дольше перенос — дольше буфер
+# монополизирован (сериализовано, см. docs/roadmap.md 5 — решение владельца:
+# не параллелить файловые переносы), и второй поток дольше ждёт своей очереди.
+BULK_CHUNK_MAX = 2 * 1024 * 1024
+# Таймаут ожидания: короче нельзя — живой стенд 27.11.2026 показал B→A лаг
+# свыше 120 с даже на голом tx/rx (память live_check_roadmap_1_4_27nov.md).
+# Не измерено живьём для файлового режима конкретно — консервативно взят
+# тот же порядок величины, что и у остальных долгих таймаутов канала.
+BULK_ACK_WAIT_S = 180.0
+BULK_WATCH_WAIT_S = 180.0
+# Отступ после неудачи (отказ fileclip, таймаут, abort, испорченный файл):
+# без него неудача за неудачей душит и файловый путь, и обычный — ни одна
+# попытка не успевает отдать байты текстом, пока buld_round снова и снова
+# хватает тот же поток под файл. Текст в отступе работает как обычно.
+BULK_COOLDOWN_S = 30.0
 # Рукопожатие TLS через буфер занимает около 8 с. Пачка параллельных
 # соединений не успевает ни одно, слоты остаются заняты, и проверка
 # «Кода онлайн» больше не стартует.
@@ -103,6 +139,43 @@ class Pipe:
         self.touch = time.monotonic()
         self.read_n = 0
         self.wrote_n = 0
+        # Файловый режим одного крупного куска (docs/roadmap.md 5) — не
+        # больше одного из двух одновременно, не по обоим сразу: этот конец
+        # либо шлёт файл для этого потока (bulk_out), либо ждёт чужой
+        # (bulk_in), никогда оба на одном Pipe.
+        self.bulk_out: "_BulkOut | None" = None
+        self.bulk_in: "_BulkIn | None" = None
+        # После любой неудачи файлового переноса — не пробовать этот же
+        # поток файлом заново тут же (иначе неудача за неудачей душит и
+        # файловый путь, и обычный текстовый — ничего не доходит вовсе).
+        # В отступе build_frames() как ни в чём не бывало режет те же байты
+        # ячейками — тексту отступ не нужен и не виден.
+        self.bulk_cooldown_until = 0.0
+
+
+@dataclass
+class _BulkOut:
+    """Мы анонсировали OP_BULK_OFFER и ждём, когда base сдвинется на offset+length
+    (обычным OP_ACK, который и так понимает apply_frames) — или по таймауту
+    откатываемся: to_peer/base/offered никто не трогал, build_frames сам
+    продолжит эти же байты ячейками."""
+
+    offset: int
+    length: int
+    digest: str
+    path: str
+    sent_at: float
+
+
+@dataclass
+class _BulkIn:
+    """Увидели чужой OP_BULK_OFFER на offset == local_got — значит это
+    следующий кусок по порядку, не повтор и не дыра. Ждём файл в буфере."""
+
+    offset: int
+    length: int
+    digest: str
+    seen_at: float
 
 
 def pack(op: int, sid: int, body: bytes = b"", offset: int = 0) -> bytes:
@@ -127,6 +200,21 @@ def unpack(payload: bytes):
         offset = int.from_bytes(payload[5:9], "big")
         return op, sid, offset, payload[_HEAD:]
     return op, sid, 0, payload[5:]
+
+
+def _pack_bulk_offer(offset: int, length: int, digest_hex: str) -> bytes:
+    """offset(4) + length(4) + sha256(32 сырых байт, не hex) — анонс, не
+    данные: OP_BULK_OFFER не входит в (OP_DATA, OP_ACK), поэтому pack()
+    кладёт это целиком в body, не трогая offset-поле кадра."""
+    return offset.to_bytes(4, "big") + length.to_bytes(4, "big") + bytes.fromhex(digest_hex)
+
+
+def _unpack_bulk_offer(body: bytes) -> tuple[int, int, str] | None:
+    if len(body) != 40:
+        return None
+    offset = int.from_bytes(body[:4], "big")
+    length = int.from_bytes(body[4:8], "big")
+    return offset, length, body[8:40].hex()
 
 
 def _meter_in(sid: int, n: int) -> None:
@@ -348,6 +436,42 @@ def text_limit(cells: int) -> int:
     return GATE_TEXT_MIN * cells // GATE_CELLS_MIN
 
 
+# Кэш последнего достигнутого потолка (docs/roadmap.md, пункт 4: "старт на
+# откалиброванных параметрах"). Активный upfront-замер потолка ячеек, как
+# у tune.py для паузы, здесь сознательно не сделан: он требовал бы, чтобы
+# ОБЕ стороны уже отвечали на пробные кадры ДО входа в listen_loop/dial_loop
+# — новая двусторонняя синхронизация именно того типа, что уже один раз
+# подвела coder host/guest на живом стенде (C1-C6, память
+# live_acceptance_gate_coder_fileshake_27nov.md). Вместо этого — то, что
+# подтверждено реальной передачей в ПРЕДЫДУЩЕМ запуске того же peer_id,
+# переживает перезапуск процесса: холодный старт с GATE_CELLS_MIN остаётся,
+# только когда и подтверждённой истории ещё не было.
+_CEILING_DIR = os.path.join(tempfile.gettempdir(), "rdpconn-ceiling")
+
+
+def _ceiling_cache_path(peer_id: str | None) -> str:
+    label = "".join(c if c.isalnum() or c in "-_." else "_" for c in (peer_id or "no-peer-id"))
+    return os.path.join(_CEILING_DIR, f"{label}.json")
+
+
+def _load_cached_ceiling(peer_id: str | None) -> int | None:
+    try:
+        with open(_ceiling_cache_path(peer_id), encoding="utf-8") as f:
+            cells = int(json.load(f)["cells"])
+    except (OSError, ValueError, KeyError):
+        return None
+    return cells if GATE_CELLS_MIN <= cells <= GATE_CELLS_MAX else None
+
+
+def _save_cached_ceiling(peer_id: str | None, cells: int) -> None:
+    try:
+        os.makedirs(_CEILING_DIR, exist_ok=True)
+        with open(_ceiling_cache_path(peer_id), "w", encoding="utf-8") as f:
+            json.dump({"cells": cells}, f)
+    except OSError:
+        pass  # кэш — это только ускорение следующего старта, не часть протокола
+
+
 class Ceiling:
     """Сколько ячеек класть в свой снимок.
 
@@ -356,8 +480,9 @@ class Ceiling:
     без чистого полного снимка — сразу на 40 и до следующей паузы.
     """
 
-    def __init__(self) -> None:
-        self.cells = GATE_CELLS_MIN
+    def __init__(self, peer_id: str | None = None) -> None:
+        self.peer_id = peer_id
+        self.cells = _load_cached_ceiling(peer_id) or GATE_CELLS_MIN
         self.allow = True
         self.strikes = 0
         self.armed = False
@@ -413,6 +538,7 @@ class Ceiling:
         if not self.allow or old >= GATE_CELLS_MAX:
             return
         self.cells = min(GATE_CELLS_MAX, old + GATE_CELLS_STEP)
+        _save_cached_ceiling(self.peer_id, self.cells)
         app.say(f".. потолок {old} → {self.cells}, полный снимок подтверждён")
 
     def _drop(self) -> None:
@@ -423,6 +549,7 @@ class Ceiling:
             self.allow = False
             self.quiet_since = None
             self.strikes = 0
+            _save_cached_ceiling(self.peer_id, self.cells)
             app.say(f".. потолок {old} → {self.cells}, вторая потеря, жду новую передачу")
             return
         self.strikes = 1
@@ -430,6 +557,7 @@ class Ceiling:
         if self.cells == GATE_CELLS_MIN:
             self.allow = False
             self.quiet_since = None
+        _save_cached_ceiling(self.peer_id, self.cells)
         app.say(f".. потолок {old} → {self.cells}, повтор не доехал")
 
     def _rearm_idle(self, pipes: dict[int, Pipe]) -> None:
@@ -626,6 +754,240 @@ def apply_frames(pipes: dict[int, Pipe], frames, dial: bool, transport=None) -> 
         elif op == OP_END:
             pipe.saw_peer = True
             pipe.remote_eof = True
+        elif op == OP_BULK_OFFER:
+            pipe.saw_peer = True
+            pipe.touch = time.monotonic()
+            parsed = _unpack_bulk_offer(body)
+            if parsed is None:
+                continue
+            offer_offset, length, digest = parsed
+            if pipe.bulk_in is None and offer_offset == pipe.local_got:
+                pipe.bulk_in = _BulkIn(offset=offer_offset, length=length,
+                                       digest=digest, seen_at=time.monotonic())
+            # Иначе — либо уже идёт приём, либо offset не совпал с local_got
+            # (повтор анонса/рассинхрон): не трогаем, отправитель сам поймёт
+            # по таймауту ожидания ACK и откатится на ячейки.
+        elif op == OP_BULK_ABORT:
+            # Абортировать может любая сторона (отправитель — если файл не
+            # ушёл в буфер; получатель — если не дождался или файл испорчен),
+            # а эта сторона заранее не знает, какая из двух своих ролей у
+            # неё сейчас активна для этого потока — снимаем обе.
+            if pipe.bulk_out is not None:
+                _cleanup_bulk_file(pipe.bulk_out.path)
+            pipe.bulk_out = None
+            pipe.bulk_in = None
+
+
+# --- файловый режим крупного куска (docs/roadmap.md, пункт 5) ---------------
+#
+# Один перенос — это переключатель всего буфера, не боковой канал:
+# fileclip.send_files() вызывает OleSetClipboard(), который заменяет текущего
+# владельца буфера целиком (см. комментарий в начале fileclip.py) — текстовый
+# G1-снимок в этот момент исчезает так же, как исчез бы при обычной вставке
+# файла поверх скопированного текста. Поэтому, пока bulk_out/bulk_in у
+# какого-то потока выставлен, обычный текстовый круг (_emit/recv_snapshot)
+# не идёт вовсе — см. _bulk_round(), вызываемый из dial_loop/listen_loop
+# раньше всего остального в теле цикла.
+#
+# Серилизовано по решению владельца: один файловый перенос на весь процесс
+# разом, не по потоку — простая очередь, не отдельный лок на Pipe.
+
+
+def _cleanup_bulk_file(path: str) -> None:
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _send_bulk_abort(transport, seq: app.SeqCounter, sid: int) -> None:
+    """OP_BULK_ABORT — и settle-пауза вслед за ним, той же природы, что у
+    анонса в _offer_bulk(): без неё собственный следующий обычный круг этой
+    же стороны переиздаёт свой снимок и стирает только что опубликованный
+    abort раньше, чем собеседник успевает его прочитать (его опрос —
+    раз в 0.2 с, а локальный MemoryClipboard успевает заново опубликовать
+    за микросекунды) — живьём пойман именно так, не домыслено."""
+    send_snapshot(transport, [_frame(seq, OP_BULK_ABORT, sid)])
+    time.sleep(max(0.5, clipboard.NUDGE_AFTER_S))
+
+
+def _offer_bulk(transport, pipe: Pipe, seq: app.SeqCounter) -> None:
+    """Объявить крупный кусок и переключить буфер на файл.
+
+    Откат при любой накладке — не особый код, а отсутствие изменений в
+    to_peer/base/offered: ничего из них здесь не трогается до настоящего
+    ACK, так что при сбое build_frames() на следующем же обычном круге сам
+    продолжит эти байты ячейками, как будто файлового режима не было.
+    """
+    length = min(len(pipe.to_peer), BULK_CHUNK_MAX)
+    chunk = bytes(pipe.to_peer[:length])
+    digest = hashlib.sha256(chunk).hexdigest()
+    offer = _frame(seq, OP_BULK_OFFER, pipe.sid,
+                  _pack_bulk_offer(pipe.base, length, digest))
+    fail = send_snapshot(transport, [offer])
+    if fail is not None:
+        app.warn(f"?? анонс файлового куска не ушёл: {fail}")
+        return
+    # Дать анонсу время дойти через редирект, прежде чем стереть его файлом:
+    # тот же запас, что уже откалиброван для повтора снимка (docs/protocol.md 5).
+    time.sleep(max(0.5, clipboard.NUDGE_AFTER_S))
+    fd, path = tempfile.mkstemp(prefix=f"rdpconn-gate-bulk-{pipe.sid}-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(chunk)
+        fileclip.send_files([path])
+    except (OSError, fileclip.ClipboardFileError) as exc:
+        app.warn(f"?? поток {pipe.sid}: файл не ушёл в буфер ({exc}), откат на ячейки")
+        _cleanup_bulk_file(path)
+        pipe.bulk_cooldown_until = time.monotonic() + BULK_COOLDOWN_S
+        # Получатель уже видел анонс — без этого он прождал бы полный таймаут.
+        _send_bulk_abort(transport, seq, pipe.sid)
+        return
+    pipe.bulk_out = _BulkOut(offset=pipe.base, length=length, digest=digest,
+                            path=path, sent_at=time.monotonic())
+    app.say(f".. поток {pipe.sid}: {length} байт файлом вместо ячеек")
+
+
+def _wait_bulk_ack(transport, pipes: dict[int, Pipe], pipe: Pipe,
+                   seq: app.SeqCounter, dial: bool) -> None:
+    """Один тик ожидания подтверждения уже отправленного файла.
+
+    Подтверждение — обычный OP_ACK (apply_frames его уже умеет: сдвигает
+    base, обрезает to_peer) на offset+length; отдельного кода «готово» не
+    нужно. pump() внутри цикла — только локальные сокеты, не трогает
+    транспорт: второй поток продолжает копить/отдавать байты локально,
+    пока этот ждёт файл, даже если сам обмен снимками сейчас не идёт.
+    """
+    state = pipe.bulk_out
+    pump(pipes, dial=dial)
+    # Не дать _reap() посчитать поток тихим во время долгого, но живого
+    # ожидания ACK — это не молчание, это другая работа на том же буфере.
+    pipe.touch = time.monotonic()
+    _reap(pipes)
+    if time.monotonic() - state.sent_at > BULK_ACK_WAIT_S:
+        app.warn(f".. поток {pipe.sid}: файл не подтверждён за {BULK_ACK_WAIT_S:.0f} с, откат на ячейки")
+        _cleanup_bulk_file(state.path)
+        pipe.bulk_out = None
+        pipe.bulk_cooldown_until = time.monotonic() + BULK_COOLDOWN_S
+        return
+    frame, err = app.receive_frame(transport, 0.2)
+    if err is not None:
+        app.warn(f"?? кадр шлюза испорчен ({err})")
+        return
+    if frame is None:
+        return
+    apply_frames(pipes, [frame], dial=dial, transport=transport)
+    if pipe.bulk_out is None:
+        # OP_BULK_ABORT уже обнулил bulk_out в apply_frames.
+        _cleanup_bulk_file(state.path)
+        pipe.bulk_cooldown_until = time.monotonic() + BULK_COOLDOWN_S
+        return
+    if pipe.base >= state.offset + state.length:
+        app.say(f".. поток {pipe.sid}: файл подтверждён")
+        _cleanup_bulk_file(state.path)
+        pipe.bulk_out = None
+
+
+def _receive_bulk(transport, pipes: dict[int, Pipe], pipe: Pipe,
+                  seq: app.SeqCounter, dial: bool) -> None:
+    """Принять уже анонсированный файл целиком — блокирующий шаг, не тик.
+
+    Короткие срезы ожидания (не весь BULK_WATCH_WAIT_S одним вызовом),
+    чтобы между ними успевать pump() для второго потока, как и в
+    _wait_bulk_ack(). Сам приём файла (list_clipboard_files/recv_file) —
+    уже короткая, однократная операция, срезать незачем.
+    """
+    state = pipe.bulk_in
+    deadline = state.seen_at + BULK_WATCH_WAIT_S
+    since_seq = fileclip.sequence_number()
+    # Файл мог лечь в буфер ещё ДО того, как мы вообще начали ждать —
+    # _offer_bulk пишет файл сразу вслед за анонсом, и наш собственный
+    # главный цикл мог добраться сюда позже этого момента. wait_for_new_file
+    # ждёт именно СМЕНУ номера с этой секунды — если файл уже лежит, смены
+    # больше не будет никогда, и ожидание было бы вечным. Поэтому сначала
+    # пробуем забрать как есть, и только если файла ещё нет — ждём смены.
+    try:
+        fileclip.list_clipboard_files()
+        already_there = True
+    except (OSError, fileclip.ClipboardFileError):
+        already_there = False
+    while not already_there:
+        pump(pipes, dial=dial)
+        pipe.touch = time.monotonic()
+        _reap(pipes)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            app.warn(f".. поток {pipe.sid}: файл не пришёл за {BULK_WATCH_WAIT_S:.0f} с, прошу откат на ячейки")
+            pipe.bulk_in = None
+            _send_bulk_abort(transport, seq, pipe.sid)
+            return
+        # Отправитель мог сам передумать (не ушло в буфер его стороны) —
+        # не ждать полный таймаут, если его OP_BULK_ABORT уже пришёл.
+        frame, err = app.receive_frame(transport, 0.05)
+        if frame is not None:
+            apply_frames(pipes, [frame], dial=dial, transport=transport)
+            if pipe.bulk_in is None:
+                return
+        try:
+            fileclip.wait_for_new_file(since_seq, timeout=min(2.0, remaining))
+            break
+        except TimeoutError:
+            continue
+    tmp_dir = tempfile.mkdtemp(prefix="rdpconn-gate-bulk-recv-")
+    try:
+        entries = fileclip.list_clipboard_files()
+        if not entries:
+            raise fileclip.ClipboardFileError("пустой список файлов в буфере")
+        out_path = os.path.join(tmp_dir, entries[0].name)
+        fileclip.recv_file(0, out_path)
+        with open(out_path, "rb") as f:
+            data = f.read()
+    except (OSError, fileclip.ClipboardFileError) as exc:
+        app.warn(f".. поток {pipe.sid}: файл не принят ({exc}), прошу откат на ячейки")
+        pipe.bulk_in = None
+        _send_bulk_abort(transport, seq, pipe.sid)
+        return
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    if len(data) != state.length or hashlib.sha256(data).hexdigest() != state.digest:
+        app.warn(f".. поток {pipe.sid}: файл пришёл испорченным ({len(data)} байт, ждали {state.length}), прошу откат на ячейки")
+        pipe.bulk_in = None
+        _send_bulk_abort(transport, seq, pipe.sid)
+        return
+    pipe.to_sock.extend(data)
+    pipe.local_got += len(data)
+    pipe.saw_peer = True
+    pipe.touch = time.monotonic()
+    pipe.bulk_in = None
+    app.say(f".. поток {pipe.sid}: {len(data)} байт файлом, подтверждаю")
+    send_snapshot(transport, [_frame(seq, OP_ACK, pipe.sid, offset=pipe.local_got)])
+
+
+def _bulk_round(transport, pipes: dict[int, Pipe], seq: app.SeqCounter, dial: bool) -> bool:
+    """Если у буфера сейчас дело к файловому каналу — сделать шаг и вернуть
+    True (обычный текстовый круг этой итерации пропускается: буфер занят
+    файлом или вот-вот будет, см. блок выше). Иначе — False, дальше как обычно.
+    """
+    incoming = next((p for p in pipes.values() if p.bulk_in is not None), None)
+    if incoming is not None:
+        _receive_bulk(transport, pipes, incoming, seq, dial)
+        return True
+    outgoing = next((p for p in pipes.values() if p.bulk_out is not None), None)
+    if outgoing is not None:
+        _wait_bulk_ack(transport, pipes, outgoing, seq, dial)
+        return True
+    if _human_quiet(transport):
+        return False
+    now = time.monotonic()
+    candidate = max(
+        (p for p in pipes.values()
+         if len(p.to_peer) >= BULK_THRESHOLD and now >= p.bulk_cooldown_until),
+        key=lambda p: len(p.to_peer), default=None,
+    )
+    if candidate is not None:
+        _offer_bulk(transport, candidate, seq)
+        return True
+    return False
 
 
 def _pull(pipe: Pipe) -> None:
@@ -743,6 +1105,10 @@ def _abandon(pipe: Pipe) -> None:
     pipe.to_peer.clear()
     pipe.to_sock.clear()
     pipe.end_sent = False
+    if pipe.bulk_out is not None:
+        _cleanup_bulk_file(pipe.bulk_out.path)
+        pipe.bulk_out = None
+    pipe.bulk_in = None
     if pipe.sock is not None:
         try:
             pipe.sock.close()
@@ -1011,16 +1377,33 @@ def dial_loop(transport, stop, wait: float, face: monitor.Face | None = None) ->
     pipes: dict[int, Pipe] = {}
     seq = app.SeqCounter()
     bias = Bias()
-    ceiling = Ceiling()
+    ceiling = Ceiling(peer_id=transport.peer_id)
+    # В отличие от listen_loop, у dial_loop не было вообще никакой индикации
+    # тишины (ни обычной, ни хронической) — до первого кадра от собеседника
+    # (даже самого первого OP_OPEN) лог молчал полностью. 27.11.2026 это и
+    # произошло на живом стенде: dial не увидел НИ ОДНОГО кадра несколько
+    # минут подряд, и в логе не было ни строки — человек не знал, что вообще
+    # происходит. Общий со всем остальным каналом порог, app.CHRONIC_STALL_S.
+    last_frame_at = time.monotonic()
+    chronic_warned = False
     while not stop.is_set():
         _meter_hold(transport)
         _reap(pipes)
+        if not chronic_warned and time.monotonic() - last_frame_at >= app.CHRONIC_STALL_S:
+            chronic_warned = True
+            app.warn(f"!! от собеседника нет ни кадра дольше {app.CHRONIC_STALL_S / 60:.0f} мин — "
+                     f"не похоже на обычную паузу редиректа. Если mstsc открыт уже давно, "
+                     f"попробуйте переподключить RDP-сессию, прежде чем разбираться дальше")
+        if _bulk_round(transport, pipes, seq, dial=True):
+            continue
         if _human_quiet(transport):
             now = time.monotonic()
             for pipe in pipes.values():
                 pipe.touch = now
             frames = recv_snapshot(transport, 0.2)
             if frames:
+                last_frame_at = time.monotonic()
+                chronic_warned = False
                 bias.note_peer(frames)
                 apply_frames(pipes, frames, dial=True, transport=transport)
                 ceiling.observe(pipes)
@@ -1034,6 +1417,8 @@ def dial_loop(transport, stop, wait: float, face: monitor.Face | None = None) ->
                 gather(pipes, 0.05, ceiling.cells)
                 _emit(transport, pipes, seq, poll=False, bias=bias, ceiling=ceiling)
             continue
+        last_frame_at = time.monotonic()
+        chronic_warned = False
         bias.note_peer(frames)
         apply_frames(pipes, frames, dial=True, transport=transport)
         ceiling.observe(pipes)
@@ -1225,15 +1610,22 @@ def listen_loop(transport, proxy_host: str, proxy_port: int, stop, wait: float,
     pipes: dict[int, Pipe] = {}
     seq = app.SeqCounter(1)
     bias = Bias()
-    ceiling = Ceiling()
+    ceiling = Ceiling(peer_id=transport.peer_id)
     nxt = 1
     # Растёт на каждой подряд идущей тишине (см. _SILENCE_BACKOFF_MAX_S),
     # сбрасывается в wait, как только пришёл настоящий ответ.
     silence_wait = wait
+    # Момент начала текущей серии тишины и было ли уже сказано про
+    # возможную деградацию сессии (app.CHRONIC_STALL_S, один раз на серию —
+    # не на каждый цикл бэкоффа).
+    silence_since: float | None = None
+    chronic_warned = False
     try:
         while not stop.is_set():
             nxt = _accept(srv, pipes, nxt)
             pump(pipes, dial=False)
+            if _bulk_round(transport, pipes, seq, dial=False):
+                continue
             waiting = any(p.target and not p.failed and not (p.local_eof and p.remote_eof) for p in pipes.values())
             if _human_quiet(transport):
                 now = time.monotonic()
@@ -1283,6 +1675,14 @@ def listen_loop(transport, proxy_host: str, proxy_port: int, stop, wait: float,
                 for pipe in pipes.values():
                     pipe.end_sent = False
                 app.warn(f".. тишина шлюза {silence_wait:.1f} с, повторю снимок")
+                if silence_since is None:
+                    silence_since = time.monotonic()
+                elif not chronic_warned and time.monotonic() - silence_since >= app.CHRONIC_STALL_S:
+                    chronic_warned = True
+                    app.warn(f"!! тишина шлюза дольше {app.CHRONIC_STALL_S / 60:.0f} мин без единого "
+                             f"признака жизни — не похоже на обычную паузу редиректа. Если mstsc "
+                             f"открыт уже давно, попробуйте переподключить RDP-сессию, прежде чем "
+                             f"разбираться дальше")
                 ceiling.observe(pipes)
                 app.trace("gate-silence", side="listen", waited=round(time.monotonic() - sent_at, 2),
                           gap_was=round(silence_wait, 1))
@@ -1291,6 +1691,8 @@ def listen_loop(transport, proxy_host: str, proxy_port: int, stop, wait: float,
             app.trace("gate-reply", side="listen", waited=round(time.monotonic() - sent_at, 2),
                       cells=len(reply), bytes=sum(len(frame.payload) for frame in reply))
             silence_wait = wait
+            silence_since = None
+            chronic_warned = False
             bias.note_peer(reply)
             apply_frames(pipes, reply, dial=False, transport=transport)
             ceiling.observe(pipes)
@@ -1348,7 +1750,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        channel = app.open_channel(args)
+        channel = app.open_channel(args, role=f"gate-{args.mode}")
     except app.UsageError as exc:
         app.warn(str(exc))
         return 2

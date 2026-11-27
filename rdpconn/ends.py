@@ -65,13 +65,23 @@ def main(role: str, argv=None) -> int:
     if args.drop and args.feed == "net":
         app.warn("папка (--drop) пока только для feed=model, игнорирую")
         args.drop = ""
-    if role == "guest" and not coder.claim_guest():
+    if role == "guest" and args.feed == "model" and not coder.claim_guest():
         app.warn("кодер уже в сессии")
         return 0
-    if role == "guest":
+    if role == "guest" and args.feed == "model":
         coder.watch_parent()
+    # guest+model уже защищён выше claim_guest() (кооперативная пересдача
+    # Cline, не отказ оператора) -- отдельный лок здесь был бы вторым,
+    # расходящимся механизмом для той же роли. Остальные три сочетания
+    # делят код с gate.py/coder.py (dial_loop/listen_loop/serve напрямую,
+    # см. _model()/_net() ниже) и до сих пор не были защищены вовсе.
+    lock_role = {
+        ("host", "model"): "coder-host",
+        ("host", "net"): "gate-dial",
+        ("guest", "net"): "gate-listen",
+    }.get((role, args.feed))
     try:
-        channel = app.open_channel(args)
+        channel = app.open_channel(args, role=lock_role)
     except app.UsageError as exc:
         app.warn(str(exc))
         return 2

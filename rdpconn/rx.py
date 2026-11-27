@@ -433,7 +433,7 @@ def step(args, transport, hb, frame, err, codec: str = config.CODEPAGE,
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        channel = app.open_channel(args)
+        channel = app.open_channel(args, role="rx")
     except app.UsageError as exc:
         app.warn(str(exc))
         return 2
