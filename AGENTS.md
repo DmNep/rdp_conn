@@ -169,6 +169,7 @@ python tools\test_diag.py         # стартовая подсказка: ин�
 python tools\test_gate_ceiling_cache.py  # потолок ячеек переживает перезапуск процесса
 python tools\test_gate_bulk.py     # крупный кусок через fileclip вместо ячеек, откат при сбое
 python tools\test_gate_chronic_stall.py  # подсказка переподключить RDP при затяжном простое dial/listen
+python tools\test_clipboard_write_retry.py  # retry SetClipboardData (gle=1418), настоящая гонка двух процессов
 ```
 
 Прогонять через PowerShell, как в этом разделе: `test_duplex.py` под
@@ -259,6 +260,17 @@ git-bash/MINGW даёт ложный `FAIL` на проверке `cmd /c set` �
   просто "канал считается потерянным". Срабатывает один раз на эпизод
   простоя, не на каждый тик. Регресс — `tools/test_reconnect.py` (сценарии
   6-7), `tools/test_gate_chronic_stall.py`.
+- **`SetClipboardData` между `OpenClipboard` и собой не атомарна — чужой
+  процесс может перехватить буфер в этой щели (`gle=1418`,
+  `ERROR_CLIPBOARD_NOT_OPEN`).** Найдено живьём 27.11.2026 на `F:\rdp-lab`,
+  воспроизведено локально гонкой двух процессов (~0.22% попыток при тугом
+  цикле). `_open()` уже ретраил `OpenClipboard`, но сама запись —
+  нет. Починено тем же паттерном retry/backoff в `write()`
+  (`_SET_RETRIES=5`, `_SET_WAIT_S=0.02`). Попутно всплыл второй, независимый
+  баг на том же пути: у `kernel32.GlobalFree` не было `argtypes`, и
+  64-битный хэндл ронял `OverflowError` — путь «все retry исчерпаны →
+  освободить блок» раньше не существовал вовсе (блок утекал), поэтому
+  пропуск был незаметен. Регресс — `tools/test_clipboard_write_retry.py`.
 
 ## 7. Соглашения
 

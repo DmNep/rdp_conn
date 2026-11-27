@@ -187,6 +187,11 @@ class WindowsClipboard:
         k.GlobalLock.restype = ctypes.c_void_p
         k.GlobalLock.argtypes = [ctypes.c_void_p]
         k.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        # Без явного argtypes ctypes угадывает int по умолчанию и 64-битный
+        # хэндл не проходит (OverflowError) — путь, который реально этот
+        # вызов исполняет (отказ SetClipboardData после всех retry), раньше
+        # не существовал вовсе, поэтому пропуск здесь был незаметен.
+        k.GlobalFree.argtypes = [ctypes.c_void_p]
 
     def seq(self) -> int:
         """Номер изменения буфера: растёт на любую запись, нашу или чужую.
