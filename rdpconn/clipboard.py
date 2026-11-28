@@ -1138,6 +1138,10 @@ class ClipboardTransport:
                 defer_nudge = False
             if not defer_nudge:
                 self._maybe_nudge()
+            elif self._nudge_at is not None:
+                from . import app as _app
+                _app.trace("gate-clip-nudge-deferred", peer=self.peer_id,
+                          seen_seq=self._seen_seq)
 
             now = time.monotonic()
             seq = self._store.seq()
@@ -1145,6 +1149,9 @@ class ClipboardTransport:
             # время записывает ответ, и OpenClipboard ему мешает.
             if seq != self._seen_seq:
                 if self._pending_seq != seq:
+                    from . import app as _app
+                    _app.trace("gate-clip-seq-new", peer=self.peer_id,
+                               seq=seq, seen_seq=self._seen_seq)
                     self._pending_seq = seq
                     self._stale_tries = 0
                     # Первое чтение сразу: на слоте в памяти текст уже новый,
@@ -1158,13 +1165,22 @@ class ClipboardTransport:
                     continue
                 try:
                     text = self._store.read()
-                except ClipboardError:
+                except ClipboardError as _exc:
+                    from . import app as _app
+                    _app.trace("gate-clip-read-error", peer=self.peer_id,
+                               seq=seq, error=str(_exc))
                     # Номер не двигаем. Иначе кадр останется в слоте, а
                     # следующий опрос решит, что ничего не менялось.
                     if now >= deadline:
                         return None
                     time.sleep(POLL_S)
                     continue
+                from . import app as _app
+                if text is None:
+                    _app.trace("gate-clip-read-none", peer=self.peer_id, seq=seq)
+                else:
+                    _app.trace("gate-clip-read-ok", peer=self.peer_id, seq=seq,
+                               length=len(text), head=text[:60], dup=(text == self._last_text))
                 # Пока строка прежняя, номер открыт. Следующий receive()
                 # продолжит ждать: ожидание длиннее одного вызова.
                 if text == self._last_text:
@@ -1216,10 +1232,17 @@ class ClipboardTransport:
         self._nudge_at = None
         self._nudge_mine = None
         if mine is None or self._my_history is not mine or self.paused:
+            from . import app as _app
+            _app.trace("gate-clip-nudge-skipped", peer=self.peer_id,
+                      mine_is_none=mine is None,
+                      history_mismatch=mine is not None and self._my_history is not mine,
+                      paused=self.paused)
             return
         frames = [base64.b64decode(b64) for _, b64 in reversed(mine)]
         if not frames:
             return
+        from . import app as _app
+        _app.trace("gate-clip-nudge-fire", peer=self.peer_id, n_frames=len(frames))
         self._publish_many(frames, keep_history=False, schedule_nudge=False)
         hook = getattr(self, "on_nudge", None)
         if hook is not None:
@@ -1250,6 +1273,27 @@ class ClipboardTransport:
                 "следующую часть пишут после ответа на эту"
             )
         self._publish_many([frame_bytes], keep_history=True, schedule_nudge=True)
+
+    def cancel_nudge(self) -> None:
+        """Снять отложенный повтор последней публикации.
+
+        Нужно звать перед тем, как буфер будет занят чем-то, что сама
+        публикация не умеет учитывать — например, файлом в bulk-режиме
+        `gate.py` (`_offer_bulk()`). Иначе `_maybe_nudge()` на ближайшем
+        `receive()` классическим `SetClipboardData` перепишет буфер назад
+        текстом поверх только что установленного OLE-объекта раньше, чем
+        редирект успеет его хоть раз передать второй стороне — найдено
+        живым прогоном 28.11.2026 (`gate_bulk_oleSetClipboard_hang.md`):
+        `send_snapshot()` любого кадра всегда безусловно взводит nudge
+        (`transport._nudge_once = True`), и в `_offer_bulk()` это тот же
+        самый анонс `OP_BULK_OFFER`, что публикуется перед settle-паузой
+        (`NUDGE_AFTER_S`) и записью файла — тот же интервал, что и у
+        задержки самого nudge, поэтому совпадение не на миллисекунды, а
+        системное: nudge срабатывает практически сразу после того, как
+        файл лёг в буфер, на каждом прогоне.
+        """
+        self._nudge_at = None
+        self._nudge_mine = None
 
     def _schedule_nudge(self) -> None:
         if not isinstance(self._store, WindowsClipboard) or self.paused:
@@ -1351,6 +1395,8 @@ class ClipboardTransport:
             if self._write_held() or self._refuse_human(text_in):
                 self._meter_out = 0
                 return
+            from . import app as _app
+            _app.trace("gate-clip-publish-write", peer=self.peer_id, length=len(merged))
             self._store.write(merged)
             self._note_local_write(merged)
             if text_in == self._human_released_text:
@@ -1363,6 +1409,8 @@ class ClipboardTransport:
                 break
         else:
             if not landed and not self._write_held() and not self._refuse_human(text_in):
+                from . import app as _app
+                _app.trace("gate-clip-publish-write-fallback", peer=self.peer_id, length=len(merged))
                 self._store.write(merged)
                 self._note_local_write(merged)
                 if text_in == self._human_released_text:

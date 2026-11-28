@@ -74,6 +74,11 @@ user32.RegisterClipboardFormatW.restype = ctypes.c_uint
 user32.GetClipboardFormatNameW.argtypes = [ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_int]
 user32.GetClipboardFormatNameW.restype = ctypes.c_int
 user32.GetClipboardSequenceNumber.restype = ctypes.c_uint
+user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+user32.OpenClipboard.restype = ctypes.c_int
+user32.CloseClipboard.restype = ctypes.c_int
+user32.EnumClipboardFormats.argtypes = [ctypes.c_uint]
+user32.EnumClipboardFormats.restype = ctypes.c_uint
 kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
 kernel32.GlobalLock.restype = ctypes.c_void_p
 kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
@@ -465,21 +470,79 @@ def recv_file(index: int, out_path: str | Path, *, chunk: int = 524288,
     return result
 
 
+def _list_current_formats() -> list[str] | None:
+    """Диагностика: что РЕАЛЬНО сейчас лежит в буфере (все форматы, не
+    только FileGroupDescriptorW). Только для трассировки живого стенда
+    (gate_bulk_oleSetClipboard_hang.md) — не часть обычного пути
+    приёма, вызывается редко (раз в несколько секунд из heartbeat).
+    None при любой накладке (буфер занят и т.п.) — не мешать основному
+    ожиданию диагностикой."""
+    if not user32.OpenClipboard(None):
+        return None
+    try:
+        names = []
+        fmt = 0
+        for _ in range(64):
+            fmt = user32.EnumClipboardFormats(fmt)
+            if fmt == 0:
+                break
+            buf = ctypes.create_unicode_buffer(256)
+            n = user32.GetClipboardFormatNameW(fmt, buf, 256)
+            names.append(buf.value if n > 0 else f"#{fmt}")
+        return names
+    finally:
+        user32.CloseClipboard()
+
+
 def wait_for_new_file(since_seq: int, *, poll_interval: float = 0.05, timeout: float = 120.0) -> int:
     """Спать, пока в буфере не появится новый FileGroupDescriptorW.
 
     Проверяем и смену seq() (дешёвая проверка на каждый тик), и реально ли
     это файл (не любое другое изменение буфера — тот же текстовый обмен
     `gate`/`coder` на этой же машине тоже меняет seq()). Возвращает новый seq.
+
+    since_seq — исходная граница, НЕ сдвигается на каждую замеченную смену
+    seq(): раньше сдвигалась (`since_seq = seq`), и это тихо "хоронило"
+    ровно тот момент, когда файл реально появился, но редиректор ещё не
+    успел сделать формат доступным (`IsClipboardFormatAvailable` — та же
+    гонка с публикацией, что и у `list_clipboard_files()`/`recv_file()`,
+    см. их докстринги). После такого списания следующий тик видел
+    seq() == (уже списанному) since_seq и больше НИ РАЗУ не перепроверял
+    формат — а следующей смены seq() часто не бывает вовсе, отправитель
+    публикует файл один раз, не переиздаёт. На практике это съедало почти
+    всё окно единственного тика: gate.py вызывает эту функцию повторно с
+    timeout≈2с на каждый заход, и с этим багом реальная проверка формата
+    успевала попасть только в первые ~0.05с каждого захода, а не во все
+    ~40 тиков внутри него. Найдено живым прогоном gate.py 28.11.2026
+    (gate_bulk_oleSetClipboard_hang.md): дважды подряд уходило в
+    180-секундный `BULK_WATCH_WAIT_S`, хотя файл физически лежал в
+    буфере. Теперь каждый тик после первой смены seq() перепроверяет
+    формат заново, пока не появится или не кончится timeout.
     """
     deadline = time.monotonic() + timeout
+    started = time.monotonic()
     cf_fgd = user32.RegisterClipboardFormatW("FileGroupDescriptorW")
+    latest_seq = since_seq
+    ticks = 0
+    last_trace = started
     while time.monotonic() < deadline:
         seq = sequence_number()
+        ticks += 1
         if seq != since_seq:
-            if user32.IsClipboardFormatAvailable(cf_fgd):
-                return seq
-            since_seq = seq
+            avail = bool(user32.IsClipboardFormatAvailable(cf_fgd))
+            if seq != latest_seq:
+                app.trace("fileclip-wait-seq-change", since_seq=since_seq,
+                          seq=seq, available=avail, elapsed=round(time.monotonic() - started, 2))
+            latest_seq = seq
+            if avail:
+                return latest_seq
+        now = time.monotonic()
+        if now - last_trace >= 2.0:
+            app.trace("fileclip-wait-heartbeat", since_seq=since_seq, seq=seq,
+                      available=bool(user32.IsClipboardFormatAvailable(cf_fgd)),
+                      formats=_list_current_formats(),
+                      ticks=ticks, elapsed=round(now - started, 2))
+            last_trace = now
         time.sleep(poll_interval)
     raise TimeoutError(f"файл не появился в буфере за {timeout:g} с")
 

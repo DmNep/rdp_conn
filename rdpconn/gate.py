@@ -82,6 +82,20 @@ BULK_WATCH_WAIT_S = 180.0
 # попытка не успевает отдать байты текстом, пока buld_round снова и снова
 # хватает тот же поток под файл. Текст в отступе работает как обычно.
 BULK_COOLDOWN_S = 30.0
+# fileclip.py's свои дефолты (15 попыток × 0.1 с ≈ 1.5 с) калиброваны по
+# её собственным прежним живым тестам (file-FileClipboard, F:\rdp-lab) —
+# но живой прогон G6 28.11.2026 (трассировка, gate_bulk_oleSetClipboard_hang.md)
+# показал: вызванные ИЗНУТРИ bulk-режима gate, list_clipboard_files()/
+# recv_file() стабильно падали HRESULT 0x80040064 все 15 попыток подряд,
+# не единожды. Не чинить фикс fileclip.py-дефолты (другие вызывающие —
+# CLI, host/guest --drop — на этих значениях уже подтверждены живьём),
+# а дать именно bulk-режиму свой, намного более терпеливый бюджет:
+# тот же шаг (0.1 с), но в 10 раз больше попыток — тот же порядок
+# величины, что и задокументированный лаг обычного кругового обмена на
+# живом редиректе («до 8 с»), с запасом. Не измерено, достаточно ли
+# этого — следующий живой прогон покажет.
+BULK_FILE_RECV_RETRIES = 150
+BULK_FILE_RECV_RETRY_WAIT_S = 0.1
 # Рукопожатие TLS через буфер занимает около 8 с. Пачка параллельных
 # соединений не успевает ни одно, слоты остаются заняты, и проверка
 # «Кода онлайн» больше не стартует.
@@ -185,13 +199,20 @@ class _BulkOut:
 
 @dataclass
 class _BulkIn:
-    """Увидели чужой OP_BULK_OFFER на offset == local_got — значит это
-    следующий кусок по порядку, не повтор и не дыра. Ждём файл в буфере."""
+    """Увидели чужой OP_BULK_OFFER на offset <= local_got — значит в файле
+    либо ровно продолжение (offset == local_got), либо голова файла
+    повторяет то, что уже дошло ячейками (offset < local_got, отправитель
+    анонсировал от base, не от того, что он ЛОКАЛЬНО считает уже
+    отправленным) — то и другое принимаем, skip просто обрезает
+    известную голову перед тем, как дописать в to_sock. offset > local_got
+    была бы дырой — такой анонс здесь не окажется, apply_frames его не
+    создаёт."""
 
     offset: int
     length: int
     digest: str
     seen_at: float
+    skip: int
 
 
 def pack(op: int, sid: int, body: bytes = b"", offset: int = 0) -> bytes:
@@ -777,12 +798,25 @@ def apply_frames(pipes: dict[int, Pipe], frames, dial: bool, transport=None) -> 
             if parsed is None:
                 continue
             offer_offset, length, digest = parsed
-            if pipe.bulk_in is None and offer_offset == pipe.local_got:
+            app.trace("gate-offer-seen", sid=pipe.sid, offer_offset=offer_offset,
+                      length=length, local_got=pipe.local_got, bulk_in=pipe.bulk_in is not None)
+            if pipe.bulk_in is None and offer_offset <= pipe.local_got:
                 pipe.bulk_in = _BulkIn(offset=offer_offset, length=length,
-                                       digest=digest, seen_at=time.monotonic())
-            # Иначе — либо уже идёт приём, либо offset не совпал с local_got
-            # (повтор анонса/рассинхрон): не трогаем, отправитель сам поймёт
-            # по таймауту ожидания ACK и откатится на ячейки.
+                                       digest=digest, seen_at=time.monotonic(),
+                                       skip=pipe.local_got - offer_offset)
+                # Симметрично dial-стороне (_offer_bulk): свой же
+                # отложенный nudge классическим SetClipboardData
+                # способен стереть ПРИХОДЯЩИЙ файл из буфера этой
+                # стороны не хуже, чем отправительский — отменить его,
+                # пока идёт приём.
+                if transport is not None:
+                    cancel_nudge = getattr(transport, "cancel_nudge", None)
+                    if cancel_nudge is not None:
+                        cancel_nudge()
+            # Иначе — либо уже идёт приём, либо offset > local_got (дыра:
+            # отправитель анонсировал то, что мы ещё не видели даже
+            # ячейками) — не трогаем, отправитель сам поймёт по таймауту
+            # ожидания ACK и откатится на ячейки.
         elif op == OP_BULK_ABORT:
             # Абортировать может любая сторона (отправитель — если файл не
             # ушёл в буфер; получатель — если не дождался или файл испорчен),
@@ -830,28 +864,85 @@ def _send_bulk_abort(transport, seq: app.SeqCounter, sid: int) -> None:
 def _offer_bulk(transport, pipe: Pipe, seq: app.SeqCounter) -> None:
     """Объявить крупный кусок и переключить буфер на файл.
 
+    Анонс обязан начинаться с pipe.base (уже подтверждено ACK), не с
+    pipe.offered (уже отправлено ячейками, но ACK мог и не дойти, а на
+    локально-быстром буфере собеседник мог вообще не успеть прочитать
+    снимок перед тем, как его перекрыл следующий) — анонс от offered
+    молча терялся ровно тогда, когда собеседник в этот момент ещё не
+    видел тех самых ячеек: local_got оставался позади offset анонса, и
+    по правилу apply_frames (не дыра — не принимать) анонс отбрасывался,
+    а не только на живом рассинхроне 28.11.2026 (память
+    gate_bulk_oleSetClipboard_hang.md), но и в tools/test_gate_bulk.py на
+    MemoryClipboard, где это воспроизводится почти всегда.
+
+    base — единственная величина с гарантией: то, что отправитель НЕ
+    ACKнул, собеседник мог как получить (ACK просто не успел прийти), так
+    и не получить вовсе (ACK придёт позже) — но base никогда не бывает
+    ВПЕРЕДИ того, что собеседник видел. Поэтому хвост, который собеседник
+    уже получил ячейками (local_got между base и offer_offset+length),
+    принимающая сторона обрезает сама (apply_frames/_receive_bulk,
+    tolerant-match по offer_offset <= local_got) — не дыра, а повтор уже
+    известного, которого можно просто не дублировать в to_sock.
+
     Откат при любой накладке — не особый код, а отсутствие изменений в
-    to_peer/base/offered: ничего из них здесь не трогается до настоящего
-    ACK, так что при сбое build_frames() на следующем же обычном круге сам
-    продолжит эти байты ячейками, как будто файлового режима не было.
+    to_peer/base до настоящего ACK: при сбое build_frames() на следующем
+    же обычном круге сам продолжит байты с pipe.base ячейками, как будто
+    файлового режима не было.
     """
     length = min(len(pipe.to_peer), BULK_CHUNK_MAX)
     chunk = bytes(pipe.to_peer[:length])
     digest = hashlib.sha256(chunk).hexdigest()
     offer = _frame(seq, OP_BULK_OFFER, pipe.sid,
                   _pack_bulk_offer(pipe.base, length, digest))
+    app.trace("gate-offer-publish", sid=pipe.sid, offset=pipe.base, length=length)
     fail = send_snapshot(transport, [offer])
     if fail is not None:
         app.warn(f"?? анонс файлового куска не ушёл: {fail}")
         return
-    # Дать анонсу время дойти через редирект, прежде чем стереть его файлом:
-    # тот же запас, что уже откалиброван для повтора снимка (docs/protocol.md 5).
-    time.sleep(max(0.5, clipboard.NUDGE_AFTER_S))
+    # send_snapshot() безусловно взводит nudge (транспорт сам не знает,
+    # что этот конкретный кадр — анонс перед файлом, не обычная ячейка).
+    # Без отмены nudge на ближайшем receive() классическим
+    # SetClipboardData перепишет буфер назад текстом поверх только что
+    # установленного OLE-объекта — и совпадёт по времени почти всегда,
+    # не изредка: settle ниже и задержка nudge — один и тот же
+    # NUDGE_AFTER_S. Живым прогоном 28.11.2026 подтверждено: nudge
+    # срабатывал через ~53 мс после записи файла, на каждой попытке
+    # (gate_bulk_oleSetClipboard_hang.md).
+    cancel_nudge = getattr(transport, "cancel_nudge", None)
+    if cancel_nudge is not None:
+        cancel_nudge()
+    # Дать анонсу время дойти через редирект, прежде чем стереть его файлом —
+    # тот же запас, что уже откалиброван для повтора снимка (docs/protocol.md
+    # 5). Один статичный sleep() здесь недостаточен: собеседник мог быть
+    # занят СВОЕЙ публикацией (ответ на предыдущий обычный круг) именно в
+    # момент этой записи и физически не опросить буфер, пока редирект (или
+    # наш же следующий локальный write) не сменит содержимое ещё раз —
+    # окно длиной в один снимок первой же попытки, живьём поймано
+    # 28.11.2026 (gate_bulk_oleSetClipboard_hang.md): offer ушёл и был
+    # записан корректно, но у listen'а between двух его опросов буфера
+    # номер сразу перескочил на файловый — сам текст анонса ни разу не
+    # попал в его окно чтения. Повтор того же анонса безопасен (это не
+    # переключение формата, обычный merge с чужими ячейками через
+    # _publish_many) — в отличие от nudge ПОСЛЕ записи файла, который и
+    # был прошлой находкой этого дня.
+    settle = max(0.5, clipboard.NUDGE_AFTER_S)
+    app.trace("gate-offer-settle-begin", sid=pipe.sid, settle_s=settle)
+    repeat_every = 0.2
+    elapsed = 0.0
+    while elapsed < settle:
+        time.sleep(min(repeat_every, settle - elapsed))
+        elapsed += repeat_every
+        send_snapshot(transport, [offer])
+        if cancel_nudge is not None:
+            cancel_nudge()
+    app.trace("gate-offer-settle-end", sid=pipe.sid)
     fd, path = tempfile.mkstemp(prefix=f"rdpconn-gate-bulk-{pipe.sid}-")
     try:
         with os.fdopen(fd, "wb") as f:
             f.write(chunk)
+        app.trace("gate-offer-filewrite-begin", sid=pipe.sid)
         fileclip.send_files([path])
+        app.trace("gate-offer-filewrite-end", sid=pipe.sid)
     except (OSError, fileclip.ClipboardFileError) as exc:
         app.warn(f"?? поток {pipe.sid}: файл не ушёл в буфер ({exc}), откат на ячейки")
         _cleanup_bulk_file(path)
@@ -911,11 +1002,18 @@ def _receive_bulk(transport, pipes: dict[int, Pipe], pipe: Pipe,
     Короткие срезы ожидания (не весь BULK_WATCH_WAIT_S одним вызовом),
     чтобы между ними успевать pump() для второго потока, как и в
     _wait_bulk_ack(). Сам приём файла (list_clipboard_files/recv_file) —
-    уже короткая, однократная операция, срезать незачем.
+    по-прежнему один непрерывный блокирующий шаг, не срезанный на тики:
+    второй поток уже не обслуживается во время него, как и раньше (один
+    файловый перенос на процесс, решение владельца, см. блок выше), но
+    с BULK_FILE_RECV_RETRIES этот шаг теперь может занять заметно дольше
+    одной короткой попытки (до ~BULK_FILE_RECV_RETRIES× RETRY_WAIT_S на
+    каждый из двух вызовов) — компромисс принят осознанно, не регресс.
     """
     state = pipe.bulk_in
     deadline = state.seen_at + BULK_WATCH_WAIT_S
     since_seq = fileclip.sequence_number()
+    app.trace("gate-receive-bulk-enter", sid=pipe.sid, since_seq=since_seq,
+             offset=state.offset, length=state.length)
     # Файл мог лечь в буфер ещё ДО того, как мы вообще начали ждать —
     # _offer_bulk пишет файл сразу вслед за анонсом, и наш собственный
     # главный цикл мог добраться сюда позже этого момента. wait_for_new_file
@@ -923,7 +1021,8 @@ def _receive_bulk(transport, pipes: dict[int, Pipe], pipe: Pipe,
     # больше не будет никогда, и ожидание было бы вечным. Поэтому сначала
     # пробуем забрать как есть, и только если файла ещё нет — ждём смены.
     try:
-        fileclip.list_clipboard_files()
+        fileclip.list_clipboard_files(formatetc_retries=BULK_FILE_RECV_RETRIES,
+                                      formatetc_retry_wait=BULK_FILE_RECV_RETRY_WAIT_S)
         already_there = True
     except (OSError, fileclip.ClipboardFileError):
         already_there = False
@@ -951,11 +1050,13 @@ def _receive_bulk(transport, pipes: dict[int, Pipe], pipe: Pipe,
             continue
     tmp_dir = tempfile.mkdtemp(prefix="rdpconn-gate-bulk-recv-")
     try:
-        entries = fileclip.list_clipboard_files()
+        entries = fileclip.list_clipboard_files(formatetc_retries=BULK_FILE_RECV_RETRIES,
+                                                formatetc_retry_wait=BULK_FILE_RECV_RETRY_WAIT_S)
         if not entries:
             raise fileclip.ClipboardFileError("пустой список файлов в буфере")
         out_path = os.path.join(tmp_dir, entries[0].name)
-        fileclip.recv_file(0, out_path)
+        fileclip.recv_file(0, out_path, formatetc_retries=BULK_FILE_RECV_RETRIES,
+                           formatetc_retry_wait=BULK_FILE_RECV_RETRY_WAIT_S)
         with open(out_path, "rb") as f:
             data = f.read()
     except (OSError, fileclip.ClipboardFileError) as exc:
@@ -970,8 +1071,12 @@ def _receive_bulk(transport, pipes: dict[int, Pipe], pipe: Pipe,
         pipe.bulk_in = None
         _send_bulk_abort(transport, seq, pipe.sid)
         return
-    pipe.to_sock.extend(data)
-    pipe.local_got += len(data)
+    # state.skip — голова файла, которая у нас уже есть ячейками (анонс
+    # считался от pipe.base отправителя, не от нашего local_got): дописываем
+    # только то, чего действительно не было, иначе задублировали бы байты.
+    new_data = data[state.skip:]
+    pipe.to_sock.extend(new_data)
+    pipe.local_got += len(new_data)
     pipe.saw_peer = True
     pipe.touch = time.monotonic()
     pipe.bulk_in = None
