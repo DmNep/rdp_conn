@@ -96,14 +96,30 @@ def decode(payload: bytes):
 
 
 def _note(raw: bytes):
-    """Кадр из транспорта — байты. Чужой тип и чужая магия просто не наши."""
+    """Кадр из транспорта — байты. Чужой тип и чужая магия просто не наши.
+
+    Трассирует каждое отбрасывание не тише, чем gate-clip-* в clipboard.py
+    трассирует сам приём: иначе на стороне, которая никогда не видит
+    host-unpacked-request/guest-sent-request, невозможно отличить "канал
+    молчит" от "канал шлёт кадры, но не C1" — ровно то, что осталось
+    невыясненным в живом прогоне 27.11.2026 (C1-C6 не дали ни одного цикла,
+    причина не определена), см. память live_acceptance_gate_coder_fileshake_27nov.md.
+    """
     try:
         frame = framing.parse_frame(raw)
-    except framing.FrameError:
+    except framing.FrameError as exc:
+        trace("link-frame-reject", reason=str(exc), n=len(raw))
         return None
     if frame.type != config.NOTE:
+        trace("link-frame-foreign-type", frame_type=frame.type_name, seq=frame.seq)
         return None
-    return decode(frame.payload)
+    decoded = decode(frame.payload)
+    if decoded is None:
+        trace("link-frame-foreign-magic", n=len(frame.payload), head=frame.payload[:8].hex())
+        return None
+    op, flags, mid, part, body = decoded
+    trace("link-frame-c1", op=op, flags=flags, mid=mid, part=part, n=len(body))
+    return decoded
 
 
 def split_body(body: bytes) -> list[bytes]:
@@ -172,6 +188,7 @@ class Link:
             parsed = _note(raw)
             if parsed and parsed[0] == OP_ACK and parsed[2] == mid:
                 return
+        trace("link-wait-ack-timeout", mid=mid)
         raise CoderError("снимок не подтвердили")
 
     def _write(self, body: bytes, last_op: int, flags_base: int) -> int:
@@ -253,6 +270,7 @@ class Link:
                     on_tick(None)
                 if deadline is None:
                     continue
+                trace("link-window-timeout", parts=len(parts))
                 raise CoderError("окно текста не доехало")
             if timeout is not None:
                 deadline = time.monotonic() + timeout
